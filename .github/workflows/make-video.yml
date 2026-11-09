@@ -1,0 +1,75 @@
+name: Сделать видео
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes_file:
+        description: "Файл заметок в папке notes/ (например notes/example.txt)"
+        required: true
+        default: "notes/example.txt"
+      format:
+        description: "Формат видео"
+        required: true
+        type: choice
+        default: long
+        options:
+          - long
+          - short
+          - both
+      minutes:
+        description: "Желаемая длина длинного видео, минут (10–30)"
+        required: false
+        default: "14"
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+      PYTHONUNBUFFERED: "1"
+      NOTES_FILE: ${{ inputs.notes_file }}
+      VIDEO_FORMAT: ${{ inputs.format }}
+      VIDEO_MINUTES: ${{ inputs.minutes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установить ffmpeg и шрифты
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg fonts-dejavu-core
+
+      - name: Установить зависимости
+        run: pip install -r requirements.txt
+
+      - name: Проверить файл заметок
+        run: |
+          if [ ! -f "$NOTES_FILE" ]; then
+            echo "::error::Файл $NOTES_FILE не найден. Доступные заметки:"
+            ls -1 notes/
+            exit 1
+          fi
+
+      - name: Собрать видео
+        run: >
+          python -m sirlat
+          --notes "$NOTES_FILE"
+          --format "$VIDEO_FORMAT"
+          --minutes "${VIDEO_MINUTES:-14}"
+
+      - name: Сохранить видео и сценарии
+        uses: actions/upload-artifact@v4
+        with:
+          name: sir-lat-${{ inputs.format }}-${{ github.run_number }}
+          path: |
+            output/**/*.mp4
+            output/**/script_*.txt
+          if-no-files-found: error
+          retention-days: 14
