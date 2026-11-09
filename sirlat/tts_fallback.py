@@ -50,15 +50,14 @@ def _retry(fn, what, attempts=3, delay=4):
 
 def _ffmpeg_decode(path: str, tempo: float = 1.0, semitones: float = 0.0) -> np.ndarray:
     """Аудиофайл -> float32 mono SAMPLE_RATE, с изменением темпа и высоты."""
-    flt = []
+    flt = [f"aresample={SAMPLE_RATE}"]   # сначала к общей частоте, иначе asetrate исказит темп
     if abs(semitones) > 0.01:
         f = 2 ** (semitones / 12)
         flt += [f"asetrate={int(SAMPLE_RATE * f)}", f"aresample={SAMPLE_RATE}", f"atempo={1 / f:.4f}"]
     if abs(tempo - 1) > 0.001:
         flt.append(f"atempo={max(0.5, min(2.0, tempo)):.4f}")
     cmd = ["ffmpeg", "-v", "error", "-i", path]
-    if flt:
-        cmd += ["-af", ",".join(flt)]
+    cmd += ["-af", ",".join(flt)]
     cmd += ["-f", "f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1"]
     res = subprocess.run(cmd, capture_output=True, check=True)
     return np.frombuffer(res.stdout, dtype=np.float32).copy()

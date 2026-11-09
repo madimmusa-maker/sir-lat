@@ -39,6 +39,24 @@ notes/*.txt ─► Gemini (сценарий от лица сэра Лата, с 
 («Gemini: сработала модель …»). Чтобы первой пробовалась другая модель, задайте переменную
 репозитория `GEMINI_MODEL` (*Settings → Secrets and variables → Actions → Variables*).
 
+## Пробы голоса
+
+Workflow *Actions → «Пробы голоса» → Run workflow* озвучивает одну фразу (её можно поменять
+в поле `text`) голосами Silero `aidar`, Silero `eugene` и edge-tts `ru-RU-DmitryNeural`, каждым
+в трёх вариантах:
+
+| Файл | Подача |
+|---|---|
+| `…_obychny.mp3` | обычный голос |
+| `…_vyshe.mp3` | чуть выше и быстрее: +2,5 полутона, темп +10% |
+| `…_energichno.mp3` | заметно выше и энергичнее: +4,5 полутона, темп +18% |
+
+Например, `aidar_vyshe.mp3`. Громкость всех проб выровнена. Все файлы и отчёт `otchet.txt`
+лежат в одном artifact `proby-golosa-…`. Если edge-tts не даёт звук со сдвигом высоты,
+обычная запись Дмитрия сдвигается через ffmpeg — это отмечено в отчёте.
+
+Локально: `python -m sirlat.voice_samples` (результат в `voice_samples/`).
+
 ## Запуск на своём компьютере
 
 Нужны Python 3.10+, ffmpeg и шрифт с кириллицей (DejaVu).
