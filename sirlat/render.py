@@ -252,10 +252,10 @@ class Item:
         return self.start + self.speech.duration
 
 
-def speak_part(part: Part, offline: bool) -> list[tuple[Phrase, Speech]]:
+def speak_part(part: Part, offline: bool, engine: str | None = None) -> list[tuple[Phrase, Speech]]:
     out = []
     for ph in part.phrases:
-        out.append((ph, synthesize(ph.text, offline=offline)))
+        out.append((ph, synthesize(ph.text, offline=offline, engine=engine)))
     return out
 
 

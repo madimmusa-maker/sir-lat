@@ -1,16 +1,23 @@
-"""Озвучка: edge-tts (ru-RU-DmitryNeural) с границами слов (WordBoundary).
+"""Озвучка по фразам с точными таймингами слов.
 
-Каждая фраза озвучивается отдельно и кэшируется в .cache/tts/. Возвращаем PCM
-(float32, моно, 24 кГц) и тайминги слов, выровненные по исходному тексту
-фразы — так субтитры совпадают с голосом слово в слово.
+Цепочка движков (первый ответивший используется для всего видео):
+  1. Silero TTS v4_ru (голос eugene, затем aidar) — основной;
+  2. edge-tts ru-RU-DmitryNeural — тайминги слов из WordBoundary;
+     несколько вариантов запроса и повторы с паузой;
+  3. gTTS.
+Любая ошибка движка не роняет сборку: берётся следующий голос.
+У запасных движков тайминги слов даёт faster-whisper (см. tts_fallback.py).
+Озвученные фразы кэшируются в .cache/tts/.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
+import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -29,6 +36,7 @@ class Word:
 class Speech:
     audio: np.ndarray   # float32 mono SAMPLE_RATE
     words: list[Word]
+    engine: str = "edge"
 
     @property
     def duration(self) -> float:
@@ -39,6 +47,25 @@ def _norm(s: str) -> str:
     return re.sub(r"[^0-9a-zа-яё]", "", s.lower().replace("ё", "е"))
 
 
+def fmt_rate(value) -> str:
+    """'-8%', '-8', -8, '8%' -> '-8%' / '+8%' (edge-tts требует знак и %)."""
+    m = re.fullmatch(r"\s*([+-]?)(\d+)\s*%?\s*", str(value))
+    if not m:
+        raise ValueError(f"Неверная скорость речи: {value!r} (пример: -8%)")
+    return f"{m.group(1) or '+'}{int(m.group(2))}%"
+
+
+def fmt_pitch(value) -> str:
+    """'-6Hz', '-6', -6, '6hz' -> '-6Hz' / '+6Hz'."""
+    m = re.fullmatch(r"\s*([+-]?)(\d+)\s*(?:hz)?\s*", str(value), re.I)
+    if not m:
+        raise ValueError(f"Неверная высота голоса: {value!r} (пример: -6Hz)")
+    return f"{m.group(1) or '+'}{int(m.group(2))}Hz"
+
+
+RATE, PITCH = fmt_rate(VOICE_RATE), fmt_pitch(VOICE_PITCH)
+
+
 def decode_audio(data: bytes) -> np.ndarray:
     proc = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "f32le", "-ac", "1",
@@ -47,10 +74,11 @@ def decode_audio(data: bytes) -> np.ndarray:
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
-async def _edge(text: str) -> tuple[bytes, list[dict]]:
+async def _edge(text: str, rate: str, pitch: str) -> tuple[bytes, list[dict]]:
     import edge_tts
-    com = edge_tts.Communicate(text, VOICE, rate=VOICE_RATE, pitch=VOICE_PITCH,
-                               boundary="WordBoundary")
+    proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or None
+    com = edge_tts.Communicate(text, VOICE, rate=rate, pitch=pitch,
+                               boundary="WordBoundary", proxy=proxy)
     audio = bytearray()
     bounds = []
     async for chunk in com.stream():
@@ -63,6 +91,28 @@ async def _edge(text: str) -> tuple[bytes, list[dict]]:
                 "end": (chunk["offset"] + chunk["duration"]) / 1e7,
             })
     return bytes(audio), bounds
+
+
+def _edge_phrase(text: str) -> tuple[bytes, list[dict]]:
+    """Несколько вариантов запроса, у каждого — повторы с растущей паузой."""
+    variants = [(RATE, PITCH, 3), (RATE, "+0Hz", 2), ("+0%", "+0Hz", 2)]
+    last = None
+    for rate, pitch, attempts in variants:
+        for i in range(attempts):
+            try:
+                data, bounds = asyncio.run(_edge(text, rate, pitch))
+                if len(data) < 1000:
+                    raise RuntimeError("пустой звук")
+                if (rate, pitch) != (RATE, PITCH):
+                    print(f"  edge-tts ответил с параметрами {rate}, {pitch}")
+                return data, bounds
+            except Exception as e:  # noqa: BLE001
+                last = e
+                wait = 3 * 2 ** i
+                print(f"  edge-tts ({rate}, {pitch}): {type(e).__name__}: {str(e)[:120]}; "
+                      f"повтор через {wait} с")
+                time.sleep(wait)
+    raise RuntimeError(f"edge-tts не отвечает: {type(last).__name__}: {last}")
 
 
 def align(text: str, bounds: list[dict], total: float) -> list[Word]:
@@ -130,33 +180,65 @@ def _fake_tts(text: str) -> tuple[np.ndarray, list[dict]]:
     return np.concatenate(out), bounds
 
 
-def synthesize(text: str, offline: bool = False) -> Speech:
-    key = hashlib.sha1(f"{VOICE}|{VOICE_RATE}|{VOICE_PITCH}|{offline}|{text}".encode()).hexdigest()[:20]
-    d = CACHE / "tts"
-    d.mkdir(parents=True, exist_ok=True)
-    f_audio, f_meta = d / f"{key}.mp3", d / f"{key}.json"
+SILERO_FIRST = os.getenv("SIRLAT_SILERO_SPEAKER", "eugene")
+# Порядок голосов: Silero основной (edge-tts на GitHub Actions часто не отвечает),
+# edge-tts — запасной, gTTS — последний. Можно переопределить: SIRLAT_TTS=edge,silero,gtts
+_SILERO = [f"silero:{sp}" for sp in dict.fromkeys([SILERO_FIRST, "eugene", "aidar"])]
+_ORDER = [x.strip() for x in os.getenv("SIRLAT_TTS", "silero,edge,gtts").split(",") if x.strip()]
+ENGINES = [e for name in _ORDER for e in (_SILERO if name == "silero" else [name])]
+_broken: set[str] = set()
+_announced: set[str] = set()
+
+
+def _run_engine(engine: str, text: str) -> tuple[np.ndarray, list[dict]]:
+    from . import tts_fallback as fb
+    if engine == "edge":
+        data, bounds = _edge_phrase(text)
+        return decode_audio(data), bounds
+    if engine.startswith("silero:"):
+        audio = fb.silero(text, engine.split(":", 1)[1], RATE, PITCH)
+    elif engine == "gtts":
+        audio = fb.gtts(text, RATE, PITCH)
+    else:
+        raise ValueError(engine)
+    bounds = fb.whisper_words(audio, prompt=text) or fb.estimate_words(text, audio)
+    return audio, bounds
+
+
+def synthesize(text: str, offline: bool = False, engine: str | None = None) -> Speech:
+    """Озвучивает фразу первым работающим движком (или заданным engine)."""
     if offline:
         audio, bounds = _fake_tts(text)
-        return Speech(audio, align(text, bounds, len(audio) / SAMPLE_RATE))
-    if not (f_audio.exists() and f_meta.exists()):
-        last = None
-        for attempt in range(5):
-            try:
-                data, bounds = asyncio.run(_edge(text))
-                if not data:
-                    raise RuntimeError("пустой ответ edge-tts")
-                break
-            except Exception as e:  # noqa: BLE001
-                last = e
-                import time
-                time.sleep(2 * 2 ** attempt)
+        return Speech(audio, align(text, bounds, len(audio) / SAMPLE_RATE), "offline")
+    d = CACHE / "tts"
+    d.mkdir(parents=True, exist_ok=True)
+    chain = [engine] if engine else [e for e in ENGINES if e not in _broken]
+    errors = []
+    for eng in chain:
+        if not engine and eng in _broken:
+            continue
+        key = hashlib.sha1(f"{eng}|{VOICE}|{RATE}|{PITCH}|{text}".encode()).hexdigest()[:20]
+        f_audio, f_meta = d / f"{key}.npy", d / f"{key}.json"
+        if f_audio.exists() and f_meta.exists():
+            audio = np.load(f_audio)
+            bounds = json.loads(f_meta.read_text())
         else:
-            raise RuntimeError(f"edge-tts не смог озвучить фразу: {text!r}: {last}")
-        f_audio.write_bytes(data)
-        f_meta.write_text(json.dumps(bounds, ensure_ascii=False))
-    audio = decode_audio(f_audio.read_bytes())
-    bounds = json.loads(f_meta.read_text())
-    return Speech(audio, align(text, bounds, len(audio) / SAMPLE_RATE))
+            try:
+                audio, bounds = _run_engine(eng, text)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{eng}: {type(e).__name__}: {str(e)[:200]}")
+                if not engine:
+                    # torch/модель Silero не загрузились — второй голос Silero тоже не поможет
+                    _broken.update(_SILERO if eng.startswith("silero:") else [eng])
+                    print(f"TTS: {eng} не сработал ({type(e).__name__}) — переключаюсь на запасной голос")
+                continue
+            np.save(f_audio, audio.astype(np.float32))
+            f_meta.write_text(json.dumps(bounds, ensure_ascii=False))
+        if eng not in _announced:
+            print(f"TTS: озвучиваю движком {eng}")
+            _announced.add(eng)
+        return Speech(audio, align(text, bounds, len(audio) / SAMPLE_RATE), eng)
+    raise RuntimeError("Ни один голос не сработал:\n  " + "\n  ".join(errors))
 
 
 def mouth_levels(audio: np.ndarray, fps: int, n_frames: int) -> np.ndarray:

@@ -47,8 +47,21 @@ def build(fmt: str, notes: str, out_dir: Path, args) -> Path:
         phrases = [p for part in script.parts for p in part.phrases]
         script.parts = [Part(script.title, phrases)]
 
-    print("Озвучка (edge-tts)…")
+    print("Озвучка (Silero → edge-tts → gTTS)…")
     spoken_parts = [speak_part(p, args.offline) for p in script.parts]
+    engines = [sp.engine for part in spoken_parts for _, sp in part]
+    if len(set(engines)) > 1:
+        # голос сменился посреди видео — переозвучиваем всё последним рабочим движком
+        from collections import Counter
+        final = engines[-1]
+        print(f"Голос сменился по ходу озвучки ({dict(Counter(engines))}) — "
+              f"переозвучиваю все фразы движком {final}")
+        try:
+            spoken_parts = [speak_part(p, args.offline, engine=final) for p in script.parts]
+        except Exception as e:  # noqa: BLE001
+            print(f"  не получилось ({type(e).__name__}: {e}) — оставляю смешанную озвучку")
+    if engines:
+        print(f"Озвучка: {engines[-1]}")
 
     if fmt == "short":
         sp = spoken_parts[0]
