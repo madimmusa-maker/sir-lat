@@ -134,6 +134,14 @@ def _tag(ph) -> str:
 
 
 def render_all(fmt, script, spoken_parts, out_dir: Path, args, layout) -> Path:
+    if not args.offline and not args.no_bg_gen:
+        # фоны для сцен без своих картинок: Gemini-описание -> Pollinations / FLUX.1-schnell
+        from .bg_gen import ensure_backgrounds
+        try:
+            ensure_backgrounds([ph for part in script.parts for ph in part.phrases],
+                               vertical=layout.H > layout.W)
+        except Exception as e:  # noqa: BLE001
+            print(f"Фоны-генерация: пропускаю ({type(e).__name__}: {e})")
     parts_dir = out_dir / f"parts_{fmt}"
     parts_dir.mkdir(parents=True, exist_ok=True)
     files = []
@@ -175,6 +183,8 @@ def main(argv=None):
     ap.add_argument("--reuse-script", action="store_true",
                     help="взять уже сгенерированный сценарий из output/, если он есть")
     ap.add_argument("--keep-parts", action="store_true", help="не удалять отдельные части")
+    ap.add_argument("--no-bg-gen", action="store_true",
+                    help="не генерировать фоны (только свои картинки и нарисованные сцены)")
     ap.add_argument("--no-voice", action="store_true",
                     help="не использовать свою запись из voice/, даже если она есть")
     ap.add_argument("--out", default=None, help="папка для результатов")

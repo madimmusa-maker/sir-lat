@@ -27,6 +27,8 @@ jobs:
     timeout-minutes: 300
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # запасной генератор фонов FLUX.1-schnell (необязательно)
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
       PYTHONUNBUFFERED: "1"
       # распознавание своей записи голоса (voice/): medium точнее small
@@ -65,6 +67,14 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: whisper-${{ vars.WHISPER_MODEL || 'medium' }}-v1
+
+      # сгенерированные фоны переживают запуск — похожие сцены берут готовые
+      - name: Кэш сгенерированных фонов
+        uses: actions/cache@v4
+        with:
+          path: backgrounds/generated
+          key: bg-generated-${{ github.run_id }}
+          restore-keys: bg-generated-
 
       - name: Найти файл заметок
         # Ищем во всех папках notes/ репозитория. Можно указать путь
@@ -111,5 +121,6 @@ jobs:
             output/**/*.mp4
             output/**/*_golos_chistyj.mp3
             output/**/script_*.txt
+            backgrounds/generated/
           if-no-files-found: error
           retention-days: 14

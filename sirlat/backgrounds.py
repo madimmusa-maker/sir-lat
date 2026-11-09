@@ -113,18 +113,29 @@ def load_all() -> list[Background]:
     return out
 
 
-class Picker:
-    """Выбирает картинку для фразы по смыслу; для формата — нужной ориентации."""
+def _is_generated(b: Background) -> bool:
+    return "generated" in b.path.relative_to(ROOT).parts
 
-    def __init__(self, vertical: bool, seed: int = 0):
+
+class Picker:
+    """Выбирает картинку для фразы по смыслу; для формата — нужной ориентации.
+
+    Два уровня: сначала ваши картинки из backgrounds/, и только если ни одна
+    не подходит по смыслу — сгенерированные из backgrounds/generated/.
+    """
+
+    def __init__(self, vertical: bool, seed: int = 0, include_generated: bool = True, quiet: bool = False):
         allb = load_all()
-        same = [b for b in allb if b.vertical == vertical]
-        self.items = same or allb
+        if not include_generated:
+            allb = [b for b in allb if not _is_generated(b)]
         self.rnd = random.Random(seed)
-        if allb:
-            kind = "вертикальных" if vertical else "горизонтальных"
-            note = "" if same else f" (нет {kind} — беру другие и обрезаю)"
-            print(f"Фоны: {len(self.items)} картинок из backgrounds/{note}")
+        self.tiers = []
+        for tier in ([b for b in allb if not _is_generated(b)], [b for b in allb if _is_generated(b)]):
+            same = [b for b in tier if b.vertical == vertical]
+            self.tiers.append(same or tier)
+        self.items = self.tiers[0] + self.tiers[1]
+        if self.items and not quiet:
+            print(f"Фоны: ваших картинок {len(self.tiers[0])}, сгенерированных {len(self.tiers[1])}")
 
     def __bool__(self):
         return bool(self.items)
@@ -136,22 +147,30 @@ class Picker:
             s += 1.5
         return s
 
+    def best_score(self, text: str, scene: str | None) -> float:
+        return max((self.score(b, text, scene) for b in self.items), default=0.0)
+
     def choose(self, text: str, scene: str | None, current: Path | None) -> Path | None:
         """Лучшая по смыслу картинка или None (тогда фон не меняется)."""
-        scored = [(self.score(b, text, scene), b) for b in self.items]
-        best = max(s for s, _ in scored)
-        if best <= 0:
-            if current is None:   # самое начало — любая картинка
-                b = min(self.items, key=lambda b: (b.used, self.rnd.random()))
-                b.used += 1
-                return b.path
-            return None
-        top = [b for s, b in scored if s == best]
-        if current is not None and any(b.path == current for b in top):
-            return current        # подходящая уже на экране — не дёргаем
-        b = min(top, key=lambda b: (b.used, self.rnd.random()))
-        b.used += 1
-        return b.path
+        for tier in self.tiers:                       # свои картинки — в приоритете
+            if not tier:
+                continue
+            scored = [(self.score(b, text, scene), b) for b in tier]
+            best = max(s for s, _ in scored)
+            if best <= 0:
+                continue
+            top = [b for s, b in scored if s == best]
+            if current is not None and any(b.path == current for b in top):
+                return current        # подходящая уже на экране — не дёргаем
+            b = min(top, key=lambda b: (b.used, self.rnd.random()))
+            b.used += 1
+            return b.path
+        if current is None:           # самое начало — любая (сначала своя)
+            pool = self.tiers[0] or self.tiers[1]
+            b = min(pool, key=lambda b: (b.used, self.rnd.random()))
+            b.used += 1
+            return b.path
+        return None
 
 
 @lru_cache(maxsize=6)
@@ -159,7 +178,12 @@ def _prepared(path: str, W: int, H: int) -> Image.Image:
     """Картинка, обрезанная «по заполнению» под кадр с запасом OV."""
     im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
     tw, th = int(W * OV), int(H * OV)
-    return ImageOps.fit(im, (tw, th), Image.LANCZOS, centering=(0.5, 0.45))
+    out = ImageOps.fit(im, (tw, th), Image.LANCZOS, centering=(0.5, 0.45))
+    k = tw / max(1, min(im.width, im.height * tw / th))
+    if k > 1.4:   # маленькую картинку (генерация до 1024 пикс.) после увеличения чуть подтачиваем
+        from PIL import ImageFilter
+        out = out.filter(ImageFilter.UnsharpMask(radius=2, percent=60, threshold=2))
+    return out
 
 
 class ImageScene:
