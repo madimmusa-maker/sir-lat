@@ -46,14 +46,14 @@ class Layout:
 
     @property
     def lat_xy(self):
-        # правый нижний угол, бюст слегка «обрезан» краем кадра
-        return self.W - self.lat_w - 10, self.H - self.lat_h + 24
+        # правый нижний угол, низ брони слегка «обрезан» краем кадра
+        return self.W - self.lat_w + int(self.lat_w * 0.04), self.H - self.lat_h + int(self.lat_h * 0.06)
 
 
-LONG = Layout("long", 1920, 1080, lat_h=520,
+LONG = Layout("long", 1920, 1080, lat_h=650,
               sub_box=(70, 1080 - 120, 1920 - 470 - 40), sub_font=56, sub_lines=2,
               window_center=(760, 430), window_w=900, title_y=60, shot_len=7.0)
-SHORT = Layout("short", 1080, 1920, lat_h=660,
+SHORT = Layout("short", 1080, 1920, lat_h=720,
                sub_box=(60, 1110, 1020), sub_font=70, sub_lines=3,
                window_center=(540, 560), window_w=880, title_y=150, shot_len=4.0)
 
@@ -337,6 +337,7 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock
     mouths = mouth_levels(audio, FPS, n_frames)
 
     rnd = random.Random(seed * 7919 + 1)
+    lat_anim = character.Animator(FPS, seed)
     # моргания
     blinks = np.zeros(n_frames, bool)
     t = rnd.uniform(1.0, 3.0)
@@ -424,14 +425,9 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock
             emo, pose = ph.emotion, ph.pose
             mouth = int(mouths[fi]) if it and it.start <= t <= it.end + 0.05 else 0
             blink = bool(blinks[fi])
-            speed = 1.8 if emo == "laughing" else 1.0
-            ang = round(math.sin(2 * math.pi * t / 3.4) * 3)
-            bob = math.sin(2 * math.pi * t * speed / 1.7) * (7 if emo == "laughing" else 4)
-            jx = rnd.uniform(-3, 3) if emo == "scared" else 0
-            key = (emo, pose, mouth, blink, ang)
-            rgb, al = sprites.get(
-                lambda: character.frame_sprite(emo, pose, mouth, blink, ang, layout.lat_h), key)
-            blend(frame, rgb, al, int(lat_x + jx), int(lat_y + bob))
+            spr = lat_anim.frame(t, emo, pose, mouth, blink, layout.lat_h)
+            rgb, al = _to_np_rgba(spr)
+            blend(frame, rgb, al, lat_x, lat_y)
 
             # --- субтитры по словам
             if it and it.start - 0.05 <= t <= it.end + PAUSE * 0.6:
