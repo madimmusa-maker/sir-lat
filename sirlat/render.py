@@ -248,13 +248,21 @@ def _plan_shots(items, total, layout: Layout, seed: int):
     Короткие вставки (меньше min_len) сливаются с соседней сценой, длинные
     куски делятся на планы с разным движением камеры."""
     if not items:
-        return [[0.0, "scene", "dungeon", "dungeon", total]]
-    want, cur = [], None
+        return [[0.0, "scene", "dungeon", ("scene", "dungeon"), total]]
+    from .backgrounds import Picker
+    picker = Picker(vertical=layout.H > layout.W, seed=seed)
+    want, cur, cur_img = [], None, None
     for it in items:
         ph = it.phrase
         sc = (ph.scene if ph.scene_set else None) or classify(ph.text) or ph.scene or cur or "tavern"
-        want.append((sc, ph.scene_set))
         cur = sc
+        if picker:
+            # свои картинки: выбор по смыслу через имя файла
+            img = picker.choose(ph.text, sc, cur_img) or cur_img
+            cur_img = img
+            want.append((("image", str(img)), ph.scene_set))
+        else:
+            want.append((("scene", sc), ph.scene_set))
     # объединяем подряд идущие фразы с одной сценой
     runs = []
     for it, (sc, forced) in zip(items, want):
@@ -280,7 +288,8 @@ def _plan_shots(items, total, layout: Layout, seed: int):
         n = max(1, round((end - start) / (layout.shot_len * 1.3)))
         for k in range(n):
             a = start + (end - start) * k / n
-            shots.append([a, "scene", r["scene"], r["scene"]])
+            kind, val = r["scene"]
+            shots.append([a, kind, val, r["scene"]])
     for j, s_ in enumerate(shots):
         s_.append(shots[j + 1][0] if j + 1 < len(shots) else total)
     return shots  # [start, kind, value, scene, end]
@@ -379,8 +388,12 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path,
                 shot_idx += 1
                 s0, kind, val, scene, s1 = shots[shot_idx]
                 nf = int((s1 - s0) * FPS) + 2
-                # одна и та же локация во всём видео (seed=0), камера у каждого плана своя
-                bg = AnimatedScene(scene, W, H, FPS, nf, seed=0, shot_seed=seed * 31 + shot_idx)
+                if kind == "image":
+                    from .backgrounds import ImageScene
+                    bg = ImageScene(Path(val), W, H, FPS, nf, shot_seed=seed * 31 + shot_idx)
+                else:
+                    # одна и та же локация во всём видео (seed=0), камера у каждого плана своя
+                    bg = AnimatedScene(val, W, H, FPS, nf, seed=0, shot_seed=seed * 31 + shot_idx)
                 shot_start_frame = fi
             local = fi - shot_start_frame
             frame = bg.frame(local)

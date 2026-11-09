@@ -194,13 +194,15 @@ def main(argv=None):
     args.own = None
     if not args.no_voice:
         from . import own_voice
-        rec = own_voice.find_recording(src.stem)
-        if rec:
-            try:
+        # если запись есть — видео только по ней; если она испорчена — останавливаемся
+        try:
+            rec = own_voice.find_recording(src.stem)
+            if rec:
                 args.own = own_voice.prepare(rec, out_dir, src.stem)
-            except Exception as e:  # noqa: BLE001
-                msg = f"Не удалось обработать запись {rec.name}: {type(e).__name__}: {e} — озвучу синтезом"
-                print(f"::warning::{msg}" if os.getenv("GITHUB_ACTIONS") else f"ВНИМАНИЕ: {msg}")
+        except Exception as e:  # noqa: BLE001
+            msg = f"Своя запись голоса: {e}"
+            print(f"::error::{msg}" if os.getenv("GITHUB_ACTIONS") else f"ОШИБКА: {msg}")
+            return 1
 
     formats = ["long", "short"] if args.format == "both" else [args.format]
     for fmt in formats:

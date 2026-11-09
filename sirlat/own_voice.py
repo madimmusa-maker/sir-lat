@@ -44,29 +44,84 @@ def _norm(w: str) -> str:
 
 # ------------------------------------------------------------ поиск записи ---
 
+class RecordingError(RuntimeError):
+    """Запись с именем заметок есть, но использовать её нельзя (пустая, не аудио)."""
+
+
+def voice_dirs() -> list[Path]:
+    """Все папки voice/ в репозитории (корневая — первой)."""
+    dirs = [VOICE_DIR] if VOICE_DIR.is_dir() else []
+    for p in sorted(ROOT.rglob("*")):
+        if p.is_dir() and p.name.lower() == "voice" and p != VOICE_DIR and not (
+                {".git", "output", ".cache", "node_modules"} & set(p.parts)):
+            dirs.append(p)
+    return dirs
+
+
+def _split_name(name: str) -> tuple[str, str]:
+    name = name.rstrip(".")
+    if "." in name:
+        base, ext = name.rsplit(".", 1)
+        return base, "." + ext.lower()
+    return name, ""
+
+
+def _matches(base: str, stem: str) -> bool:
+    b, s_ = base.lower().strip(), stem.lower()
+    # «goblin_ch1», «Goblin_ch1», «goblin_ch1 (1)» — да; «goblin_ch10» — нет
+    return b == s_ or b.startswith(s_ + " ") or b.startswith(s_ + "(")
+
+
 def find_recording(stem: str) -> Path | None:
-    """voice/<stem>.<расширение> (поиск во всех папках voice/). Пустые файлы пропускаются."""
+    """Запись голоса: voice/<имя заметок>.<любое аудио-расширение> во всех папках voice/.
+
+    Пишет в лог все файлы папок voice/ и какой взят. Если файл с этим именем
+    есть, но пустой или не аудио — RecordingError (сборка не уйдёт в TTS молча).
+    """
     if not stem:
         return None
-    found, empty = [], []
-    for d in [VOICE_DIR] + [p for p in ROOT.rglob("voice") if p.is_dir() and p != VOICE_DIR
-                            and ".git" not in p.parts and "output" not in p.parts]:
-        if not d.is_dir():
-            continue
-        for p in d.iterdir():
+    dirs = voice_dirs()
+    if not dirs:
+        print("Голос: папки voice/ нет — озвучка синтезом речи")
+        return None
+    candidates = []
+    print("Голос: файлы в папках voice/:")
+    for d in dirs:
+        for p in sorted(d.iterdir()):
             if not p.is_file():
                 continue
-            name = p.name.rstrip(".")
-            base, ext = (name.rsplit(".", 1) + [""])[:2] if "." in name else (name, "")
-            ext = "." + ext.lower() if ext else ""
-            if base != stem or (ext and ext not in AUDIO_EXT):
-                continue
-            (found if p.stat().st_size > 1000 else empty).append(p)
-    for p in empty:
-        msg = (f"Запись {p.relative_to(ROOT)} пустая ({p.stat().st_size} байт) — загрузка не удалась. "
-               "Загрузите файл заново (m4a/mp3); пока видео будет озвучено синтезом речи.")
-        print(f"::warning::{msg}" if os.getenv("GITHUB_ACTIONS") else f"ВНИМАНИЕ: {msg}")
-    return found[0] if found else None
+            size = p.stat().st_size
+            print(f"  {p.relative_to(ROOT)}  ({size / 1024:.0f} КБ)" if size >= 1024
+                  else f"  {p.relative_to(ROOT)}  ({size} байт)")
+            base, ext = _split_name(p.name)
+            if _matches(base, stem) and ext not in (".txt", ".md", ".json"):
+                candidates.append(p)
+    if not candidates:
+        print(f"Голос: записи «{stem}» нет — озвучка синтезом речи")
+        return None
+    good = [p for p in candidates if p.stat().st_size > 4096 and _probe_seconds(p) > 0.5]
+    if not good:
+        bad = ", ".join(f"{p.relative_to(ROOT)} ({p.stat().st_size} байт)" for p in candidates)
+        raise RecordingError(
+            f"Запись голоса для «{stem}» есть, но её нельзя прочитать: {bad}. Скорее всего, загрузка "
+            "с телефона не прошла (файл пустой). Загрузите запись заново как voice/"
+            f"{stem}.m4a или .mp3 (через сайт GitHub — до 25 МБ) и запустите сборку снова. "
+            "Чтобы озвучить синтезом речи, удалите этот файл.")
+    # предпочитаем файл с понятным аудио-расширением и самый большой
+    good.sort(key=lambda p: (_split_name(p.name)[1] not in AUDIO_EXT, -p.stat().st_size))
+    rec = good[0]
+    print(f"Голос: взят файл {rec.relative_to(ROOT)} ({rec.stat().st_size / 1e6:.1f} МБ, "
+          f"{_probe_seconds(rec):.0f} с) — озвучка TTS не используется")
+    return rec
+
+
+def _probe_seconds(p: Path) -> float:
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(p)],
+                           capture_output=True, text=True, timeout=60)
+        return float(r.stdout.strip() or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 # -------------------------------------------------------------------- звук ---
