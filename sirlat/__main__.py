@@ -31,6 +31,9 @@ def _fmt(sec: float) -> str:
 def build(fmt: str, notes: str, out_dir: Path, args) -> Path:
     layout = LONG if fmt == "long" else SHORT
     script_file = out_dir / f"script_{fmt}.txt"
+    own = getattr(args, "own", None)
+    if own is not None:
+        return build_own(fmt, own, out_dir, args, layout, script_file)
     if args.script:
         text = Path(args.script).read_text(encoding="utf-8")
     elif script_file.exists() and args.reuse_script:
@@ -82,6 +85,55 @@ def build(fmt: str, notes: str, out_dir: Path, args) -> Path:
             script.parts.pop(-2)
             total = sum(part_duration(s) for s in spoken_parts)
 
+    return render_all(fmt, script, spoken_parts, out_dir, args, layout)
+
+
+def build_own(fmt, own, out_dir: Path, args, layout, script_file: Path) -> Path:
+    """Видео по своей записи голоса: сценарий и субтитры — из распознанного текста."""
+    from .script import Phrase
+    from .tts import Speech, Word
+    script = parse_script(own.script_text(f"Хроники сэра Лата: {out_dir.name}"))
+    items = []
+    for text, emo, pose, audio, words in own.phrases:
+        ph = Phrase(text, emo, pose)
+        sp = Speech(audio, [Word(w["text"], w["start"], w["end"]) for w in words], "own")
+        items.append((ph, sp))
+    if fmt == "short":
+        # тизер — начало записи, целыми фразами, до 59 секунд
+        while len(items) > 1 and part_duration(items) > SHORT_LIMIT:
+            items.pop()
+        groups = [items]
+    else:
+        # длинное видео — части примерно по 2 минуты
+        groups, cur = [], []
+        for it in items:
+            cur.append(it)
+            if part_duration(cur) >= 120:
+                groups.append(cur)
+                cur = []
+        if cur:
+            groups.append(cur)
+    script.parts = [Part(f"Часть {i + 1}" if fmt == "long" else script.title, [ph for ph, _ in g])
+                    for i, g in enumerate(groups)]
+    script_file.write_text(
+        "\n".join([f"# {script.title}"] + [
+            line for part in script.parts for line in
+            [f"## {part.title}"] + [f"[{_tag(ph)}] {ph.text}" for ph in part.phrases]]) + "\n",
+        encoding="utf-8")
+    print(f"Сценарий из записи: {sum(len(g) for g in groups)} фраз → {script_file}")
+    total = sum(part_duration(g) for g in groups)
+    print(f"Озвучка: свой голос, {_fmt(total)}")
+    if fmt == "long" and total < LONG_MIN and not args.preview:
+        print(f"ВНИМАНИЕ: видео короче 10 минут ({_fmt(total)}) — запись короткая.")
+    return render_all(fmt, script, groups, out_dir, args, layout)
+
+
+def _tag(ph) -> str:
+    from .own_voice import RU_EMO, RU_POSE
+    return RU_EMO.get(ph.emotion, "важный") + (f", {RU_POSE[ph.pose]}" if ph.pose in RU_POSE else "")
+
+
+def render_all(fmt, script, spoken_parts, out_dir: Path, args, layout) -> Path:
     parts_dir = out_dir / f"parts_{fmt}"
     parts_dir.mkdir(parents=True, exist_ok=True)
     files = []
@@ -123,6 +175,8 @@ def main(argv=None):
     ap.add_argument("--reuse-script", action="store_true",
                     help="взять уже сгенерированный сценарий из output/, если он есть")
     ap.add_argument("--keep-parts", action="store_true", help="не удалять отдельные части")
+    ap.add_argument("--no-voice", action="store_true",
+                    help="не использовать свою запись из voice/, даже если она есть")
     ap.add_argument("--out", default=None, help="папка для результатов")
     args = ap.parse_args(argv)
 
@@ -135,6 +189,18 @@ def main(argv=None):
     notes = Path(args.notes).read_text(encoding="utf-8") if args.notes else ""
     out_dir = Path(args.out) if args.out else OUTPUT / src.stem
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # своя запись голоса: voice/<имя заметок>.m4a|mp3|…
+    args.own = None
+    if not args.no_voice:
+        from . import own_voice
+        rec = own_voice.find_recording(src.stem)
+        if rec:
+            try:
+                args.own = own_voice.prepare(rec, out_dir, src.stem)
+            except Exception as e:  # noqa: BLE001
+                msg = f"Не удалось обработать запись {rec.name}: {type(e).__name__}: {e} — озвучу синтезом"
+                print(f"::warning::{msg}" if os.getenv("GITHUB_ACTIONS") else f"ВНИМАНИЕ: {msg}")
 
     formats = ["long", "short"] if args.format == "both" else [args.format]
     for fmt in formats:
