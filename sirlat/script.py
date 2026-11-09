@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 import requests
 
-from .config import EMOTIONS, GEMINI_MODEL, POSES
+from .config import EMOTIONS, GEMINI_MODELS, POSES
 from .scenes import normalize_scene
 
 
@@ -148,8 +148,36 @@ YouTube-канала «Хроники сэра Лата», где он пере�
 - Числа пиши словами, если это удобно для озвучки."""
 
 
+class ModelUnavailable(Exception):
+    """Модель не существует или недоступна для этого ключа (404 и т.п.)."""
+
+
+_active_model: str | None = None   # модель, которая уже ответила в этом запуске
+
+
+def _gemini_once(model: str, body: dict, api_key: str) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    r = requests.post(url, json=body, timeout=180, headers={"x-goog-api-key": api_key})
+    text = r.text[:300].replace("\n", " ")
+    if r.status_code == 404 or (r.status_code == 400 and re.search(
+            r"not found|not supported|is not available|unknown model", r.text, re.I)):
+        raise ModelUnavailable(f"HTTP {r.status_code}: {text}")
+    if r.status_code in (401, 403):
+        raise PermissionError(f"Gemini отклонил ключ (HTTP {r.status_code}): {text}")
+    if r.status_code in (429, 500, 502, 503, 504):
+        raise RuntimeError(f"HTTP {r.status_code}: {text}")
+    r.raise_for_status()
+    data = r.json()
+    cands = data.get("candidates") or []
+    if not cands or not cands[0].get("content", {}).get("parts"):
+        reason = (cands[0].get("finishReason") if cands else None) or data.get("promptFeedback")
+        raise RuntimeError(f"пустой ответ ({reason})")
+    return "".join(p.get("text", "") for p in cands[0]["content"]["parts"]).strip()
+
+
 def _gemini(prompt: str, api_key: str, json_mode: bool = False, temperature: float = 0.95) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    """Запрос к Gemini с перебором моделей: первая ответившая запоминается."""
+    global _active_model
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "systemInstruction": {"parts": [{"text": PERSONA}]},
@@ -157,22 +185,35 @@ def _gemini(prompt: str, api_key: str, json_mode: bool = False, temperature: flo
     }
     if json_mode:
         body["generationConfig"]["responseMimeType"] = "application/json"
-    last = None
-    for attempt in range(5):
-        try:
-            r = requests.post(url, json=body, timeout=180, headers={"x-goog-api-key": api_key})
-            if r.status_code in (429, 500, 502, 503, 504):
-                raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:300]}")
-            r.raise_for_status()
-            data = r.json()
-            parts = data["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts).strip()
-        except Exception as e:  # noqa: BLE001
-            last = e
-            wait = 4 * 2 ** attempt
-            print(f"  Gemini: ошибка ({e}); повтор через {wait} с")
-            time.sleep(wait)
-    raise RuntimeError(f"Gemini не ответил: {last}")
+    models = list(GEMINI_MODELS)
+    if _active_model:
+        models.remove(_active_model)
+        models.insert(0, _active_model)
+    errors = []
+    for model in models:
+        for attempt in range(3):
+            try:
+                text = _gemini_once(model, body, api_key)
+                if model != _active_model:
+                    print(f"Gemini: сработала модель {model}")
+                    _active_model = model
+                return text
+            except ModelUnavailable as e:
+                print(f"Gemini: модель {model} недоступна ({e}) — пробую следующую")
+                errors.append(f"{model}: {e}")
+                if model == _active_model:
+                    _active_model = None
+                break
+            except PermissionError:
+                raise
+            except Exception as e:  # noqa: BLE001  сеть, 429, 5xx, пустой ответ
+                wait = 5 * 2 ** attempt
+                print(f"  Gemini ({model}): ошибка ({e}); повтор через {wait} с")
+                errors.append(f"{model}: {e}")
+                time.sleep(wait)
+        else:
+            print(f"Gemini: модель {model} так и не ответила — пробую следующую")
+    raise RuntimeError("Ни одна модель Gemini не ответила:\n  " + "\n  ".join(errors[-6:]))
 
 
 def _outline(notes: str, n_parts: int, api_key: str) -> dict:

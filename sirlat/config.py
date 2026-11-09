@@ -19,7 +19,14 @@ VOICE_RATE = os.getenv("SIRLAT_RATE", "-8%")    # чуть медленнее
 VOICE_PITCH = os.getenv("SIRLAT_PITCH", "-6Hz")  # чуть ниже
 
 # Gemini
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Модели перебираются по очереди, пока одна не ответит. GEMINI_MODEL (если задана)
+# пробуется первой; GEMINI_MODELS — полный список через запятую.
+GEMINI_FALLBACK = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.0-flash"]
+GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "").split(",") if m.strip()] \
+    or GEMINI_FALLBACK
+_first = os.getenv("GEMINI_MODEL", "").strip()
+if _first:
+    GEMINI_MODELS = [_first] + [m for m in GEMINI_MODELS if m != _first]
 
 FPS = int(os.getenv("SIRLAT_FPS", "25"))
 SAMPLE_RATE = 24000

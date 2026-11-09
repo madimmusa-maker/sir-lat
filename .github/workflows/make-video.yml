@@ -28,7 +28,7 @@ jobs:
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
       PYTHONUNBUFFERED: "1"
       NOTES_FILE: ${{ inputs.notes_file }}
       VIDEO_FORMAT: ${{ inputs.format }}

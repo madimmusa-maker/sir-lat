@@ -178,3 +178,21 @@ def mouth_levels(audio: np.ndarray, fps: int, n_frames: int) -> np.ndarray:
     levels[x > 0.38] = 2
     levels[x > 0.68] = 3
     return levels
+
+
+def mouth_envelope(audio: np.ndarray, fps: int, n_frames: int) -> np.ndarray:
+    """Громкость голоса для клюва: 0..1 на кадр, плавно (а не «открыт/закрыт»)."""
+    sub = 4                                  # считаем чаще кадров, потом сглаживаем
+    hop = SAMPLE_RATE / (fps * sub)
+    n = n_frames * sub
+    rms = np.zeros(n, np.float32)
+    for i in range(n):
+        seg = audio[int(i * hop):int((i + 1) * hop) + int(hop)]
+        if len(seg):
+            rms[i] = float(np.sqrt(np.mean(seg * seg)))
+    voiced = rms[rms > 1e-3]
+    ref = np.percentile(voiced, 92) if len(voiced) else 1.0
+    x = np.clip(rms / max(ref, 1e-6), 0, 1.3)
+    x = np.clip((x - 0.06) / 0.94, 0, None) ** 0.75       # тише — почти закрыт, громко — шире
+    x = np.convolve(x, np.ones(3) / 3, mode="same")
+    return np.clip(x.reshape(n_frames, sub).mean(1), 0, 1)

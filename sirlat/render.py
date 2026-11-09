@@ -21,7 +21,7 @@ from .config import FPS, SAMPLE_RATE, font
 from .scenes import SCENE_KEYS, game_window, scene_image
 from .script import Part, Phrase
 from .stock import Stock
-from .tts import Speech, Word, mouth_levels, synthesize
+from .tts import Speech, Word, mouth_envelope, synthesize
 
 
 # ------------------------------------------------------------------ макеты ---
@@ -322,6 +322,46 @@ def _plan_shots(items, total, layout: Layout, stock: Stock, seed: int):
     return shots  # [start, kind, value, scene, end]
 
 
+# ------------------------------------------------------------- мимика ---
+
+STRONG_WORDS = {"никогда", "всегда", "невероятно", "ужас", "серьёзно", "внимание", "клянусь",
+                "абсолютно", "огромный", "огромная", "вообще", "честно", "именно", "главное"}
+
+
+def _is_emphatic(ph: Phrase) -> bool:
+    """«Важная» фраза: восклицание или важный/злой тон — сэр Лат подаётся вперёд."""
+    return "!" in ph.text or ph.emotion in ("important", "angry") and len(ph.text.split()) >= 5
+
+
+def _gestures(items, env, seed):
+    """Ударные слова -> короткие взмахи крылом: (время, крыло, сила в градусах)."""
+    rnd = random.Random(seed * 17 + 3)
+    out, last = [], -10.0
+    for it in items:
+        words = it.speech.words
+        if not words:
+            continue
+        loud = []
+        for w in words:
+            a, b = int((it.start + w.start) * FPS), int((it.start + w.end) * FPS) + 1
+            seg = env[a:b]
+            loud.append(float(seg.mean()) if len(seg) else 0.0)
+        mean = (sum(loud) / len(loud)) or 1.0
+        for w, lv in zip(words, loud):
+            core = w.text.strip(".,!?…:;—«»\"'()").lower()
+            score = lv / mean
+            score += 0.7 if w.text.rstrip("»\")").endswith("!") else 0
+            score += 0.5 if core in STRONG_WORDS else 0
+            score += 0.3 if len(core) >= 9 else 0
+            score += 0.3 if any(ch.isdigit() for ch in core) else 0
+            t = it.start + w.start
+            if score >= 1.55 and t - last >= 1.6:
+                side = "l" if rnd.random() < 0.7 else "r"   # чаще — крылом к экрану
+                out.append((t - 0.05, side, rnd.uniform(14, 22)))
+                last = t
+    return out
+
+
 # ----------------------------------------------------------------- рендер ---
 
 def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock,
@@ -334,17 +374,11 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock
     audio = _mix_audio(items, total)
     wav = out_path.with_suffix(".wav")
     _write_wav(wav, audio)
-    mouths = mouth_levels(audio, FPS, n_frames)
+    env = mouth_envelope(audio, FPS, n_frames)
 
-    rnd = random.Random(seed * 7919 + 1)
-    lat_anim = character.Animator(FPS, seed)
-    # моргания
-    blinks = np.zeros(n_frames, bool)
-    t = rnd.uniform(1.0, 3.0)
-    while t < total:
-        f = int(t * FPS)
-        blinks[f:f + 3] = True
-        t += rnd.uniform(2.2, 5.0) if rnd.random() > 0.15 else 0.35  # иногда двойное моргание
+    gestures = _gestures(items, env, seed)
+    emphatic = [_is_emphatic(it.phrase) for it in items]
+    lat_anim = character.Animator(FPS, layout.lat_h, seed, gestures)
     # кому какая фраза соответствует в каждом кадре
     phrase_at = np.zeros(n_frames, np.int32)
     for idx, it in enumerate(items):
@@ -423,9 +457,17 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock
 
             # --- сэр Лат
             emo, pose = ph.emotion, ph.pose
-            mouth = int(mouths[fi]) if it and it.start <= t <= it.end + 0.05 else 0
-            blink = bool(blinks[fi])
-            spr = lat_anim.frame(t, emo, pose, mouth, blink, layout.lat_h)
+            speaking = bool(it) and it.start <= t <= it.end + 0.05
+            vowel = None
+            if speaking:
+                rel = t - it.start
+                for w in it.speech.words:
+                    if w.start <= rel < w.end:
+                        vowel = character.vowel_at(w.text, (rel - w.start) / max(1e-3, w.end - w.start))
+                        break
+            spr = lat_anim.frame(t, emo, pose, float(env[fi]), vowel,
+                                 emphatic=bool(it) and emphatic[it_idx] and it.start - 0.2 <= t <= it.end,
+                                 speaking=speaking)
             rgb, al = _to_np_rgba(spr)
             blend(frame, rgb, al, lat_x, lat_y)
 
