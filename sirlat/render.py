@@ -46,13 +46,14 @@ class Layout:
 
     @property
     def lat_xy(self):
-        # правый нижний угол, низ брони слегка «обрезан» краем кадра
-        return self.W - self.lat_w + int(self.lat_w * 0.04), self.H - self.lat_h + int(self.lat_h * 0.06)
+        # левый нижний угол, по пояс: низ брони слегка «обрезан» краем кадра
+        return -int(self.lat_w * 0.04), self.H - self.lat_h + int(self.lat_h * 0.06)
 
 
+# Сэр Лат слева; субтитры в длинном видео — правее него, в шортсе — над ним.
 LONG = Layout("long", 1920, 1080, lat_h=650,
-              sub_box=(70, 1080 - 120, 1920 - 470 - 40), sub_font=56, sub_lines=2,
-              window_center=(760, 430), window_w=900, title_y=60, shot_len=7.0)
+              sub_box=(470, 1080 - 120, 1920 - 70), sub_font=56, sub_lines=2,
+              window_center=(1160, 430), window_w=900, title_y=60, shot_len=7.0)
 SHORT = Layout("short", 1080, 1920, lat_h=720,
                sub_box=(60, 1110, 1020), sub_font=70, sub_lines=3,
                window_center=(540, 560), window_w=880, title_y=150, shot_len=4.0)
@@ -378,7 +379,7 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock
 
     gestures = _gestures(items, env, seed)
     emphatic = [_is_emphatic(it.phrase) for it in items]
-    lat_anim = character.Animator(FPS, layout.lat_h, seed, gestures)
+    lat_anim = character.Animator(FPS, layout.lat_h, seed, gestures, screen_side="right")
     # кому какая фраза соответствует в каждом кадре
     phrase_at = np.zeros(n_frames, np.int32)
     for idx, it in enumerate(items):

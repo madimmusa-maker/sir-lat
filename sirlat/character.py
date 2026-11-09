@@ -177,7 +177,7 @@ def _detect_wings(base: np.ndarray):
 class Animator:
     """Собирает кадры сэра Лата нужной высоты; состояние плавно меняется во времени."""
 
-    def __init__(self, fps: int, height: int, seed: int = 0, gestures=None):
+    def __init__(self, fps: int, height: int, seed: int = 0, gestures=None, screen_side: str = "left"):
         self.fps, self.dt = fps, 1.0 / fps
         self.rnd = random.Random(seed)
         self.s = s = height / H
@@ -195,6 +195,9 @@ class Animator:
         self.visor_full = eye_top - 26 * s
         self.visor_zero = eye_top + 3 * s
         self.gestures = sorted(gestures or [])
+        # С какой стороны от сэра Лата «экран» (субтитры, события). Параметры EMO/POSE
+        # заданы для экрана слева; если экран справа — наклоны, взгляд и крылья зеркалятся.
+        self.mirror = screen_side == "right"
         # состояние
         self.w_emo = {k: 1.0 if k == "important" else 0.0 for k in EMO}
         self.w_pose = {k: 1.0 if k == "none" else 0.0 for k in POSE}
@@ -573,6 +576,9 @@ class Animator:
             k = E["shake"] * self.s / self.cw
             dx += k * (math.sin(2 * math.pi * 11.3 * t) + 0.6 * math.sin(2 * math.pi * 17.9 * t + 1))
             dy += k * 0.6 * math.sin(2 * math.pi * 13.1 * t + 2)
+        if self.mirror:
+            angle, dx, gx = -angle, -dx, -gx
+            wing = {"l": wing["r"], "r": wing["l"]}
         state = dict(open=open_, width=self.width, gx=gx, gy=gy, eye=E["eye"], lid_top=lid_top,
                      lid_bot=lid_bot, tilt=E["tilt"], curve=E["curve"] * (1 - blink), visor=E["visor"],
                      wing=wing, tint=tint, accents={k: self.w_emo[k] for k in self.accents},
