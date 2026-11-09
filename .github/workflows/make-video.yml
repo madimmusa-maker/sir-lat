@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       notes_file:
-        description: "Файл заметок в папке notes/ (например notes/example.txt)"
+        description: "Файл заметок: имя (goblin_ch1.txt) или путь (notes/goblin_ch1.txt); ищется во всех папках notes/"
         required: true
         default: "notes/example.txt"
       format:
@@ -49,13 +49,35 @@ jobs:
       - name: Установить зависимости
         run: pip install -r requirements.txt
 
-      - name: Проверить файл заметок
+      - name: Найти файл заметок
+        # Ищем во всех папках notes/ репозитория. Можно указать путь
+        # (notes/goblin_ch1.txt), просто имя (goblin_ch1.txt) или имя без .txt.
         run: |
-          if [ ! -f "$NOTES_FILE" ]; then
-            echo "::error::Файл $NOTES_FILE не найден. Доступные заметки:"
-            ls -1 notes/
-            exit 1
+          list_notes() {
+            find . \( -path ./.git -o -path ./output -o -path ./.cache \) -prune -o \
+              -type f -path '*/notes/*' -print | sed 's|^\./||' | sort
+          }
+          want="${NOTES_FILE#./}"
+          if [ -f "$want" ]; then
+            found="$want"
+          else
+            name="$(basename "$want")"
+            matches="$(list_notes | awk -F/ -v n="$name" '$NF==n || $NF==n".txt"')"
+            count="$(printf '%s' "$matches" | grep -c . || true)"
+            if [ "$count" -eq 1 ]; then
+              found="$matches"
+            elif [ "$count" -gt 1 ]; then
+              echo "::error::Найдено несколько файлов «$name». Укажите путь полностью:"
+              echo "$matches"
+              exit 1
+            else
+              echo "::error::Файл «$want» не найден ни в одной папке notes/. Доступные заметки:"
+              list_notes
+              exit 1
+            fi
           fi
+          echo "Файл заметок: $found"
+          echo "NOTES_FILE=$found" >> "$GITHUB_ENV"
 
       - name: Собрать видео
         run: >
