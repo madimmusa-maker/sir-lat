@@ -58,26 +58,27 @@ def base_image() -> Image.Image:
 # --------------------------------------------------------------- параметры ---
 # Все размеры в пикселях исходной картинки (масштабируются под кадр).
 # angle: + — наклон к экрану (влево); visor: − вверх, + вниз;
-# lid_top/lid_bot: доля закрытия века сверху/снизу; tilt: + внутренние уголки
+# Глаза по умолчанию полностью открыты; прищур (lid_top/lid_bot/curve) — только у
+# смеющегося и не дольше 1 с. lid_top/lid_bot: доля закрытия века; tilt: + внутренние уголки
 # век ниже (хмурится), − выше (волнуется); curve: «улыбчивые» нижние веки.
 EMO = {
     "important":  dict(angle=-2.5, scale=1.04, sx=1.00, sy=1.02, dx=0.00, dy=0.000, visor=-2,
-                       lid_top=0.30, lid_bot=0.00, tilt=-0.05, curve=0.0, eye=1.00, gx=0.0, gy=0.0,
+                       lid_top=0.00, lid_bot=0.00, tilt=0.00, curve=0.0, eye=1.00, gx=0.0, gy=0.0,
                        sway=0.8, shake=0.0, hop=0.0, tint=(1.0, 1.0, 1.0)),
     "surprised":  dict(angle=0.0, scale=1.08, sx=0.97, sy=1.05, dx=0.00, dy=-0.020, visor=-14,
                        lid_top=0.00, lid_bot=0.00, tilt=0.00, curve=0.0, eye=1.22, gx=0.0, gy=-0.1,
                        sway=0.5, shake=0.0, hop=0.0, tint=(1.0, 1.0, 1.0)),
     "laughing":   dict(angle=2.0, scale=1.03, sx=1.00, sy=1.00, dx=0.00, dy=0.000, visor=-5,
-                       lid_top=0.22, lid_bot=0.36, tilt=0.00, curve=0.45, eye=1.00, gx=0.0, gy=0.0,
+                       lid_top=0.14, lid_bot=0.22, tilt=0.00, curve=0.30, eye=1.00, gx=0.0, gy=0.0,
                        sway=1.4, shake=0.0, hop=1.0, tint=(1.04, 1.0, 0.98)),
     "angry":      dict(angle=6.0, scale=1.07, sx=1.04, sy=0.97, dx=-0.02, dy=0.000, visor=9,
-                       lid_top=0.30, lid_bot=0.08, tilt=0.55, curve=0.0, eye=0.95, gx=-0.2, gy=0.0,
+                       lid_top=0.00, lid_bot=0.00, tilt=0.00, curve=0.0, eye=0.95, gx=-0.2, gy=0.0,
                        sway=0.4, shake=0.6, hop=0.0, tint=(1.06, 0.95, 0.94)),
     "thoughtful": dict(angle=7.0, scale=0.98, sx=1.00, sy=1.00, dx=0.00, dy=0.000, visor=-4,
-                       lid_top=0.18, lid_bot=0.10, tilt=0.00, curve=0.0, eye=1.00, gx=-0.55, gy=-0.6,
+                       lid_top=0.00, lid_bot=0.00, tilt=0.00, curve=0.0, eye=1.00, gx=-0.55, gy=-0.6,
                        sway=1.2, shake=0.0, hop=0.0, tint=(1.0, 1.0, 1.0)),
     "scared":     dict(angle=-7.0, scale=0.91, sx=0.96, sy=0.98, dx=0.03, dy=0.000, visor=-7,
-                       lid_top=0.00, lid_bot=0.00, tilt=-0.35, curve=0.0, eye=1.14, gx=0.0, gy=0.0,
+                       lid_top=0.00, lid_bot=0.00, tilt=0.00, curve=0.0, eye=1.14, gx=0.0, gy=0.0,
                        sway=0.3, shake=2.5, hop=0.0, tint=(0.94, 0.98, 1.08)),
 }
 # позы: добавки к телу и положение крыльев (градусы, + — крыло поднимается наружу)
@@ -203,9 +204,13 @@ class Animator:
         self.gaze = [0.0, 0.0]
         self.gaze_target = [0.0, 0.0]
         self.next_saccade = self.rnd.uniform(0.8, 2.5)
-        self.blink_start = self.rnd.uniform(0.8, 2.5)
-        self.blink_queue = []
+        # моргание: 0.12–0.18 с, раз в 3–6 с, иногда двойное
+        self.next_blink = self.rnd.uniform(1.5, 4.0)
+        self.blink_t0, self.blink_dur = -10.0, 0.15
+        self.double_pending = False
+        self.last_blink = 0.0
         self.prev_emotion = None
+        self.emotion_since = 0.0
         self.t = 0.0
         self._mouth_cache = {}
 
@@ -238,8 +243,16 @@ class Animator:
             fill_h = left[:, None] * (1 - u) + right[:, None] * u
             fill = 0.5 * fill_v + 0.5 * fill_h
             d = ((xx - lx) / (rx * 1.3)) ** 2 + ((yy - ly) / (ry * 1.3)) ** 2
-            m = np.clip((1.0 - d) * 2.5, 0, 1)[..., None]
-            eyeless = patch * (1 - m) + fill * m
+            # гармоническая заливка: цвет плавно «растекается» от краёв области
+            # внутрь, поэтому на месте глаза нет заметного пятна или кольца
+            hole = d <= 1.0
+            eyeless = patch.copy()
+            eyeless[hole] = fill[hole]
+            for _ in range(400):
+                avg = (np.roll(eyeless, 1, 0) + np.roll(eyeless, -1, 0)
+                       + np.roll(eyeless, 1, 1) + np.roll(eyeless, -1, 1)) / 4
+                eyeless[hole] = avg[hole]
+            hole_soft = np.clip((1.0 - d) * 4, 0, 1)
             # сам глаз — RGBA с мягкой эллиптической маской
             de = ((xx - lx) / (rx * 1.12)) ** 2 + ((yy - ly) / (ry * 1.12)) ** 2
             ea = np.clip((1.0 - de) * 5, 0, 1)
@@ -248,7 +261,7 @@ class Animator:
             inner = 1 if cx < self.P(*self._beak_center())[0] else -1   # где внутренний уголок
             self.eyes.append(dict(cx=cx, cy=cy, rx=rx, ry=ry, box=(bx0, by0, bx1, by1),
                                   eyeless=eyeless, eye=Image.fromarray(eye_rgba.astype(np.uint8), "RGBA"),
-                                  lx=lx, ly=ly, inner=inner, yy=yy, xx=xx))
+                                  lx=lx, ly=ly, inner=inner, yy=yy, xx=xx, hole=hole_soft))
 
     def _beak_center(self):
         x0, y0, x1, y1 = LM["beak"]
@@ -415,6 +428,8 @@ class Animator:
         closed = y_top >= y_bot - 0.6
         lid = np.clip(y_top - yy + 0.5, 0, 1) + np.clip(yy - y_bot + 0.5, 0, 1)
         lid = np.maximum(np.clip(lid, 0, 1), closed.astype(np.float32))[..., None]
+        # веко — только в пределах глаза и его «впадины»; у открытого глаза ничего не меняем
+        lid = lid * e["hole"][..., None] * min(1.0, (lid_top + lid_bot) * 8)
         img[..., :3] = img[..., :3] * (1 - lid) + eyeless[..., :3] * lid
         # тёмная линия по краю верхнего века; у закрытого глаза — дуга
         inside = (np.abs(nx) < 0.97) & (yy > oy - rys * 1.3) & (yy < oy + rys * 1.3)
@@ -471,9 +486,8 @@ class Animator:
         for k in self.w_pose:
             self.w_pose[k] = _approach(self.w_pose[k], 1.0 if k == pose else 0.0, dt, 0.1)
         if emotion != self.prev_emotion:
-            if self.prev_emotion is not None and self.rnd.random() < 0.6:
-                self.blink_start = t + 0.05      # моргнуть при смене эмоции
             self.prev_emotion = emotion
+            self.emotion_since = t
         E = {k: sum(self.w_emo[e] * EMO[e][k] for e in EMO) for k in EMO["important"] if k != "tint"}
         tint = [sum(self.w_emo[e] * EMO[e]["tint"][i] for e in EMO) for i in range(3)]
         Pz = {k: sum(self.w_pose[p] * POSE[p][k] for p in POSE) for k in POSE["none"]}
@@ -500,20 +514,35 @@ class Animator:
         gx = max(-1.2, min(1.2, self.gaze[0] * (1 - self.w_emo["thoughtful"] * 0.6) + E["gx"]))
         gy = max(-1.0, min(1.0, self.gaze[1] * (1 - self.w_emo["thoughtful"] * 0.6) + E["gy"]))
 
-        # моргание: закрыть ~0.07 с, открыть ~0.12 с; иногда дважды
-        if t >= self.blink_start + 0.3:
-            double = self.rnd.random() < 0.18
-            self.blink_start = t + (0.12 if double else self.rnd.uniform(2.0, 5.5))
-        bt = t - self.blink_start
+        # моргание: быстро закрыть (0.04 с), один кадр закрыто (0.04 с), открыть;
+        # всего 0.12–0.18 с. Раз в 3–6 с, иногда сразу второе (двойное).
+        if t >= self.next_blink:
+            self.blink_t0 = self.next_blink
+            self.blink_dur = self.rnd.uniform(0.12, 0.18)
+            if not self.double_pending and self.rnd.random() < 0.18:
+                self.double_pending = True
+                self.next_blink = self.blink_t0 + self.blink_dur + self.rnd.uniform(0.08, 0.14)
+            else:
+                self.double_pending = False
+                self.next_blink = self.blink_t0 + self.rnd.uniform(3.0, 6.0)
+        bt = t - self.blink_t0
         blink = 0.0
-        if 0 <= bt < 0.07:
-            blink = bt / 0.07
-        elif 0.07 <= bt < 0.10:
+        if 0 <= bt < 0.04:
+            blink = bt / 0.04
+        elif 0.04 <= bt < 0.08:
             blink = 1.0
-        elif 0.10 <= bt < 0.22:
-            blink = 1 - (bt - 0.10) / 0.12
-        lid_top = E["lid_top"] + (1 - E["lid_top"]) * blink
-        lid_bot = E["lid_bot"] * (1 - blink)
+        elif 0.08 <= bt < self.blink_dur:
+            blink = 1 - (bt - 0.08) / (self.blink_dur - 0.08)
+        self.last_blink = blink
+        # прищур — только у смеющегося и не дольше 1 с (последние 0.2 с — плавно открывает)
+        since = t - self.emotion_since
+        squint = self.w_emo["laughing"] * (1.0 if since < 0.8 else max(0.0, 1 - (since - 0.8) / 0.2))
+        L = EMO["laughing"]
+        base_top, base_bot = L["lid_top"] * squint, L["lid_bot"] * squint
+        lid_top = base_top + (1 - base_top) * blink
+        lid_bot = base_bot * (1 - blink)
+        E["curve"] = L["curve"] * squint
+        E["tilt"] = 0.0
 
         # жесты крыльями на ударных словах
         wing = {"l": Pz["wing_l"], "r": Pz["wing_r"]}
