@@ -18,9 +18,8 @@ from PIL import Image, ImageDraw
 
 from . import character
 from .config import FPS, SAMPLE_RATE, font
-from .scenes import SCENE_KEYS, game_window, scene_image
+from .scenes import AnimatedScene, classify, game_window
 from .script import Part, Phrase
-from .stock import Stock
 from .tts import Speech, Word, mouth_envelope, synthesize
 
 
@@ -104,59 +103,6 @@ class SpriteCache:
         if len(self.c) > self.maxsize:
             self.c.popitem(last=False)
         return val
-
-
-# ------------------------------------------------------------------- фоны ---
-
-class SceneBG:
-    def __init__(self, key, seed, W, H, n_frames):
-        self.img = scene_image(key, W, H, seed)
-        self.W, self.H, self.n = W, H, max(1, n_frames)
-        rnd = random.Random(seed)
-        bh, bw = self.img.shape[:2]
-        mx, my = bw - W, bh - H
-        corners = [(0, 0), (mx, 0), (0, my), (mx, my), (mx // 2, my // 2)]
-        self.p0 = rnd.choice(corners)
-        self.p1 = rnd.choice([c for c in corners if c != self.p0])
-
-    def frame(self, i):
-        t = i / self.n
-        t = t * t * (3 - 2 * t)
-        x = int(self.p0[0] + (self.p1[0] - self.p0[0]) * t)
-        y = int(self.p0[1] + (self.p1[1] - self.p0[1]) * t)
-        return self.img[y:y + self.H, x:x + self.W].copy()
-
-    def close(self):
-        pass
-
-
-class ClipBG:
-    def __init__(self, path: Path, W, H, n_frames, fallback: SceneBG):
-        self.W, self.H, self.fb = W, H, fallback
-        self.size = W * H * 3
-        vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},"
-              "eq=brightness=-0.06:saturation=0.85")
-        self.proc = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-stream_loop", "-1", "-i", str(path), "-an",
-             "-vf", vf, "-frames:v", str(n_frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
-            stdout=subprocess.PIPE)
-        self.broken = False
-
-    def frame(self, i):
-        if not self.broken:
-            buf = self.proc.stdout.read(self.size)
-            if len(buf) == self.size:
-                return np.frombuffer(buf, np.uint8).reshape(self.H, self.W, 3).copy()
-            self.broken = True
-        return self.fb.frame(i)
-
-    def close(self):
-        try:
-            self.proc.stdout.close()
-            self.proc.kill()
-            self.proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
 
 
 # -------------------------------------------------------------- субтитры ---
@@ -295,31 +241,48 @@ def _write_wav(path, audio):
         w.writeframes(pcm.tobytes())
 
 
-def _plan_shots(items, total, layout: Layout, stock: Stock, seed: int):
-    """Разбивает часть на «планы» фона: сгенерированные сцены и стоковые клипы."""
-    rnd = random.Random(seed)
-    shots = []  # (start_time, kind, value)
-    cur_start, cur_scene = 0.0, None
-    k = 0
-    default_cycle = ["dungeon", "city", "tavern", "hero", "monster"]
-    for i, it in enumerate(items):
+def _plan_shots(items, total, layout: Layout, seed: int):
+    """Фон для каждой фразы — нарисованная сцена по смыслу:
+    1) {сцена: …} прямо перед фразой; 2) слова фразы (classify);
+    3) сцена из сценария, действующая с прошлых строк; 4) предыдущая сцена.
+    Короткие вставки (меньше min_len) сливаются с соседней сценой, длинные
+    куски делятся на планы с разным движением камеры."""
+    if not items:
+        return [[0.0, "scene", "dungeon", "dungeon", total]]
+    want, cur = [], None
+    for it in items:
         ph = it.phrase
-        scene_changed = ph.scene and ph.scene != cur_scene
-        long_enough = it.start - cur_start >= layout.shot_len
-        if i == 0 or scene_changed or long_enough:
-            start = 0.0 if i == 0 else it.start - PAUSE / 2
-            scene = ph.scene or cur_scene or default_cycle[seed % len(default_cycle)]
-            use_stock = stock.enabled and not scene_changed and k % 2 == 1 and scene != "game"
-            if use_stock:
-                shots.append([start, "stock", ph.stock, scene])
-            else:
-                if not scene_changed and i > 0 and not ph.scene and rnd.random() < 0.35:
-                    scene = rnd.choice(SCENE_KEYS[:5])
-                shots.append([start, "scene", scene, scene])
-            cur_start, cur_scene = it.start, ph.scene or cur_scene or scene
-            k += 1
-    for j, s in enumerate(shots):
-        s.append(shots[j + 1][0] if j + 1 < len(shots) else total)
+        sc = (ph.scene if ph.scene_set else None) or classify(ph.text) or ph.scene or cur or "tavern"
+        want.append((sc, ph.scene_set))
+        cur = sc
+    # объединяем подряд идущие фразы с одной сценой
+    runs = []
+    for it, (sc, forced) in zip(items, want):
+        start = it.start - PAUSE / 2
+        if runs and runs[-1]["scene"] == sc:
+            runs[-1]["end"] = it.end + PAUSE / 2
+        else:
+            runs.append(dict(scene=sc, start=start, end=it.end + PAUSE / 2, forced=forced))
+    min_len = 2.2 if layout.name == "long" else 1.6
+    merged = []
+    for r in runs:
+        if merged and r["end"] - r["start"] < min_len and not r["forced"]:
+            merged[-1]["end"] = r["end"]
+        elif merged and merged[-1]["scene"] == r["scene"]:
+            merged[-1]["end"] = r["end"]
+        else:
+            merged.append(dict(r))
+    merged[0]["start"] = 0.0
+    shots = []
+    for j, r in enumerate(merged):
+        start = r["start"] if j else 0.0
+        end = merged[j + 1]["start"] if j + 1 < len(merged) else total
+        n = max(1, round((end - start) / (layout.shot_len * 1.3)))
+        for k in range(n):
+            a = start + (end - start) * k / n
+            shots.append([a, "scene", r["scene"], r["scene"]])
+    for j, s_ in enumerate(shots):
+        s_.append(shots[j + 1][0] if j + 1 < len(shots) else total)
     return shots  # [start, kind, value, scene, end]
 
 
@@ -365,7 +328,7 @@ def _gestures(items, env, seed):
 
 # ----------------------------------------------------------------- рендер ---
 
-def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock,
+def render_part(part: Part, spoken, layout: Layout, out_path: Path,
                 seed: int = 0, show_title: bool = True, max_seconds: float | None = None):
     items, total = build_timeline(spoken)
     if max_seconds:
@@ -386,7 +349,7 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock
         a = int((it.start - (PAUSE / 2 if idx else LEAD_IN)) * FPS)
         phrase_at[max(a, 0):] = idx
 
-    shots = _plan_shots(items, total, layout, stock, seed)
+    shots = _plan_shots(items, total, layout, seed)
     sprites = SpriteCache()
     subs = SpriteCache(48)
     windows = SpriteCache()
@@ -416,12 +379,8 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path, stock: Stock
                 shot_idx += 1
                 s0, kind, val, scene, s1 = shots[shot_idx]
                 nf = int((s1 - s0) * FPS) + 2
-                sc = SceneBG(scene, seed * 31 + shot_idx, W, H, nf)
-                bg = sc
-                if kind == "stock":
-                    clip = stock.clip(val, vertical=layout.name == "short", seed=seed * 131 + shot_idx)
-                    if clip:
-                        bg = ClipBG(clip, W, H, nf, sc)
+                # одна и та же локация во всём видео (seed=0), камера у каждого плана своя
+                bg = AnimatedScene(scene, W, H, FPS, nf, seed=0, shot_seed=seed * 31 + shot_idx)
                 shot_start_frame = fi
             local = fi - shot_start_frame
             frame = bg.frame(local)

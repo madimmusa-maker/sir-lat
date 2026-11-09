@@ -19,7 +19,6 @@ from pathlib import Path
 from .config import OUTPUT
 from .render import LONG, SHORT, concat, part_duration, render_part, speak_part
 from .script import Part, make_script, parse_script
-from .stock import Stock
 
 SHORT_LIMIT = 58.5   # шортс должен быть короче 59 секунд
 LONG_MIN, LONG_MAX = 10 * 60, 30 * 60
@@ -83,7 +82,6 @@ def build(fmt: str, notes: str, out_dir: Path, args) -> Path:
             script.parts.pop(-2)
             total = sum(part_duration(s) for s in spoken_parts)
 
-    stock = Stock(offline=args.offline)
     parts_dir = out_dir / f"parts_{fmt}"
     parts_dir.mkdir(parents=True, exist_ok=True)
     files = []
@@ -94,7 +92,7 @@ def build(fmt: str, notes: str, out_dir: Path, args) -> Path:
         f = parts_dir / f"part_{i + 1:02d}.mp4"
         t0 = time.time()
         print(f"Рендер части {i + 1}/{len(script.parts)}: {part.title}")
-        dur = render_part(part, spoken, layout, f, stock, seed=i + 1,
+        dur = render_part(part, spoken, layout, f, seed=i + 1,
                           show_title=(fmt == "long"), max_seconds=budget)
         print(f"  готово: {_fmt(dur)} за {time.time() - t0:.0f} с")
         files.append(f)
@@ -119,7 +117,7 @@ def main(argv=None):
     ap.add_argument("--minutes", type=float, default=float(os.getenv("SIRLAT_MINUTES", 14)),
                     help="целевая длина длинного видео в минутах (10–30)")
     ap.add_argument("--offline", action="store_true",
-                    help="без Gemini/edge-tts/Pixabay: тестовый сценарий и синтетический голос")
+                    help="без Gemini и озвучки: тестовый сценарий и синтетический голос")
     ap.add_argument("--preview", type=float, default=None,
                     help="отрендерить только первые N секунд (для проверки)")
     ap.add_argument("--reuse-script", action="store_true",
