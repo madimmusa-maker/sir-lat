@@ -13,10 +13,7 @@ NOTES = ROOT / "notes"
 OUTPUT = ROOT / "output"
 CACHE = ROOT / ".cache"
 
-# Голос
-VOICE = os.getenv("SIRLAT_VOICE", "ru-RU-DmitryNeural")
-VOICE_RATE = os.getenv("SIRLAT_RATE", "-8%")    # чуть медленнее
-VOICE_PITCH = os.getenv("SIRLAT_PITCH", "-6Hz")  # чуть ниже
+# Голос — только Piper IGM (см. tts.py и assets/CREDITS.md)
 
 # Gemini
 # Модели перебираются по очереди, пока одна не ответит. GEMINI_MODEL (если задана)
@@ -39,6 +36,7 @@ EMOTIONS = {
     "злой": "angry",
     "задумчивый": "thoughtful",
     "испуганный": "scared",
+    "интрига": "intrigue",
 }
 # Позы: русское название -> ключ
 POSES = {

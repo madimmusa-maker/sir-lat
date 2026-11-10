@@ -174,10 +174,34 @@ def _detect_wings(base: np.ndarray):
 
 # ------------------------------------------------------------------ аниматор ---
 
+def campfire_style(canvas: Image.Image, s: float) -> Image.Image:
+    """Подгонка под низкополигональную ночную сцену: матовые цвета без мелкой
+    фактуры и бликов, ночная холодная гамма, мягкие края. Тёплый свет костра
+    добавляется покадрово (campfire.light_sprite)."""
+    from PIL import ImageEnhance
+    rgb = canvas.convert("RGB")
+    alpha = canvas.split()[3]
+    # матовость: убираем мелкую фактуру и блики, оставляя крупные плоскости
+    k = max(3, int(round(5 * s * 1.4)) | 1)
+    flat = rgb.filter(ImageFilter.MedianFilter(k)).filter(ImageFilter.GaussianBlur(0.6))
+    rgb = Image.blend(rgb, flat, 0.75)
+    rgb = ImageEnhance.Color(rgb).enhance(0.8)
+    a = np.asarray(rgb, np.float32)
+    a = a * 0.8 + 12                                   # ниже контраст, «матовые» тени
+    a = np.minimum(a, 170 + (a - 170) * 0.45)          # гасим блики и слишком белое
+    a *= np.array([0.60, 0.66, 0.86], np.float32)      # ночь: темнее и холоднее
+    rgb = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+    alpha = alpha.filter(ImageFilter.GaussianBlur(max(0.8, 1.6 * s)))   # мягкие края
+    out = rgb.convert("RGBA")
+    out.putalpha(alpha)
+    return out
+
+
 class Animator:
     """Собирает кадры сэра Лата нужной высоты; состояние плавно меняется во времени."""
 
-    def __init__(self, fps: int, height: int, seed: int = 0, gestures=None, screen_side: str = "left"):
+    def __init__(self, fps: int, height: int, seed: int = 0, gestures=None, screen_side: str = "left",
+                 style: str | None = None):
         self.fps, self.dt = fps, 1.0 / fps
         self.rnd = random.Random(seed)
         self.s = s = height / H
@@ -185,6 +209,9 @@ class Animator:
         canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         canvas.alpha_composite(base_image(), (OFF_X, OFF_Y))
         canvas = canvas.resize((self.cw, self.ch), Image.LANCZOS)
+        self.canvas_raw = np.array(canvas)     # для поиска клюва по цвету
+        if style == "campfire":
+            canvas = campfire_style(canvas, s)
         self.canvas = np.array(canvas)
         self.P = lambda x, y: ((x + OFF_X) * s, (y + OFF_Y) * s)
         self._prep_eyes()
@@ -283,8 +310,9 @@ class Animator:
         rx0, ry0, rx1, ry1 = self.mbox
         reg = Image.fromarray(self.canvas[ry0:ry1, rx0:rx1])
         arr = np.array(reg).astype(np.int32)
-        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-        orange = (r > 120) & (r - b > 50) & (g > b + 15) & (arr[..., 3] > 150)
+        raw = self.canvas_raw[ry0:ry1, rx0:rx1].astype(np.int32)
+        r, g, b = raw[..., 0], raw[..., 1], raw[..., 2]
+        orange = (r > 120) & (r - b > 50) & (g > b + 15) & (raw[..., 3] > 150)
         sp = int(round(self.split - ry0))
         lower = orange.copy()
         lower[:max(0, sp - 1)] = False
@@ -583,6 +611,40 @@ class Animator:
                      lid_bot=lid_bot, tilt=E["tilt"], curve=E["curve"] * (1 - blink), visor=E["visor"],
                      wing=wing, tint=tint, accents={k: self.w_emo[k] for k in self.accents},
                      angle=angle, scale=E["scale"] * Pz["scale"], sx=sx, sy=sy, dx=dx, dy=dy)
+        return self.render(state)
+
+    def calm_frame(self, t: float, env: float = 0.0, vowel: str | None = None,
+                   speaking: bool = False) -> Image.Image:
+        """Одна спокойная поза: только дыхание, редкое моргание и клюв в такт голосу.
+
+        Клюв: открытие по громкости (сильнее на громких слогах и гласных), быстрая,
+        но плавная атака и мягкое закрытие в паузах — без дёрганий."""
+        dt = self.dt
+        # гласные открывают клюв шире, согласные — едва; громкий слог — сильнее
+        tgt = min(1.0, env * (VOWEL_OPEN.get(vowel, 0.5) if vowel else 0.32) * 1.3) if speaking else 0.0
+        self.open = _approach(self.open, tgt, dt, 0.04 if tgt > self.open else 0.055)
+        self.width = _approach(self.width, VOWEL_WIDTH.get(vowel, 0.95) if speaking and tgt > 0.1 else 1.0,
+                               dt, 0.07)
+        # редкое моргание: раз в 4.5–8 с, 0.13–0.18 с
+        if t >= self.next_blink:
+            self.blink_t0 = self.next_blink
+            self.blink_dur = self.rnd.uniform(0.13, 0.18)
+            self.next_blink = self.blink_t0 + self.rnd.uniform(4.5, 8.0)
+        bt = t - self.blink_t0
+        blink = 0.0
+        if 0 <= bt < 0.04:
+            blink = bt / 0.04
+        elif 0.04 <= bt < 0.08:
+            blink = 1.0
+        elif 0.08 <= bt < self.blink_dur:
+            blink = 1 - (bt - 0.08) / (self.blink_dur - 0.08)
+        self.last_blink = blink
+        breath = math.sin(2 * math.pi * t / 3.6)
+        gx = 0.3 if self.mirror else -0.3       # спокойно смотрит в сторону костра/зрителя
+        state = dict(open=self.open, width=self.width, gx=gx, gy=0.05, eye=1.0, lid_top=blink, lid_bot=0.0,
+                     tilt=0.0, curve=0.0, visor=0.0, wing={}, tint=(1.0, 1.0, 1.0), accents={},
+                     angle=0.0, scale=1.0, sx=1 - 0.005 * breath, sy=1 + 0.011 * breath,
+                     dx=0.0, dy=-0.003 * max(0.0, breath))
         return self.render(state)
 
     def render(self, st) -> Image.Image:

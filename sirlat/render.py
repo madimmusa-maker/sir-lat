@@ -1,4 +1,4 @@
-"""Сборка видео: фон + сэр Лат + субтитры + голос.
+"""Сборка видео: поляна с костром + сэр Лат + облачко с эмодзи + субтитры + голос.
 
 Каждая часть сценария рендерится в отдельный mp4 (кадры собираются в numpy и
 подаются в ffmpeg через pipe), затем части склеиваются без перекодирования.
@@ -18,9 +18,10 @@ from PIL import Image, ImageDraw
 
 from . import character
 from .config import FPS, SAMPLE_RATE, font
-from .scenes import AnimatedScene, classify, game_window
+from .campfire import CampfireScene, ground_shadow, light_sprite, log_sprite
+from .overlays import bubble_events, bubble_state, game_window, thought_bubble
 from .script import Part, Phrase
-from .tts import Speech, Word, mouth_envelope, synthesize
+from .tts import Speech, Word, mouth_envelope, postprocess, synthesize
 
 
 # ------------------------------------------------------------------ макеты ---
@@ -31,36 +32,31 @@ class Layout:
     W: int
     H: int
     lat_h: int            # высота спрайта сэра Лата
+    lat_cx: float         # центр сэра Лата по горизонтали (доля ширины кадра)
     sub_box: tuple        # (x0, y_center, x1) — зона субтитров
     sub_font: int
     sub_lines: int
     window_center: tuple  # центр игрового окна
     window_w: int
     title_y: int
-    shot_len: float       # желаемая длина одного «плана» фона, сек
 
     @property
     def lat_w(self):
         return round(character.W * self.lat_h / character.H)
 
-    @property
-    def lat_xy(self):
-        # левый нижний угол, по пояс: низ брони слегка «обрезан» краем кадра
-        return -int(self.lat_w * 0.04), self.H - self.lat_h + int(self.lat_h * 0.06)
 
+# Сэр Лат сидит слева у бревна, у костра. Субтитры — там, где их не перекрывает
+# ни он, ни костёр: в шортсе внизу (тёмный передний план), в длинном — справа.
+LONG = Layout("long", 1920, 1080, lat_h=760, lat_cx=0.17,
+              sub_box=(760, 1080 - 120, 1920 - 70), sub_font=56, sub_lines=2,
+              window_center=(1240, 380), window_w=860, title_y=60)
+SHORT = Layout("short", 1080, 1920, lat_h=700, lat_cx=0.21,
+               sub_box=(60, 1690, 1020), sub_font=70, sub_lines=3,
+               window_center=(540, 520), window_w=880, title_y=150)
 
-# Сэр Лат слева; субтитры в длинном видео — правее него, в шортсе — над ним.
-LONG = Layout("long", 1920, 1080, lat_h=650,
-              sub_box=(470, 1080 - 120, 1920 - 70), sub_font=56, sub_lines=2,
-              window_center=(1160, 430), window_w=900, title_y=60, shot_len=7.0)
-SHORT = Layout("short", 1080, 1920, lat_h=720,
-               sub_box=(60, 1110, 1020), sub_font=70, sub_lines=3,
-               window_center=(540, 560), window_w=880, title_y=150, shot_len=4.0)
-
-PAUSE = 0.38       # пауза между фразами
 LEAD_IN = 0.6      # тишина в начале части
 TAIL = 0.7         # тишина в конце части
-XFADE = 0.4        # перекрёстная смена фона
+REVEAL_PAUSE = 0.8 # пауза перед развязкой
 
 
 # --------------------------------------------------------------- композитинг ---
@@ -193,25 +189,38 @@ class Item:
     phrase: Phrase
     speech: Speech
     start: float
+    pause: float = 0.3     # пауза перед фразой
 
     @property
     def end(self):
         return self.start + self.speech.duration
 
 
-def speak_part(part: Part, offline: bool, engine: str | None = None) -> list[tuple[Phrase, Speech]]:
+def speak_part(part: Part, offline: bool = False) -> list[tuple[Phrase, Speech]]:
     out = []
     for ph in part.phrases:
-        out.append((ph, synthesize(ph.text, offline=offline, engine=engine)))
+        out.append((ph, synthesize(ph.text, ph.emotion, offline=offline)))
     return out
 
 
+def pause_before(prev: Phrase | None, ph: Phrase) -> float:
+    """0.2–0.4 с между фразами; перед развязкой (или после интриги) — 0.8 с."""
+    if prev is None:
+        return 0.0
+    if getattr(ph, "reveal", False) or prev.emotion == "intrigue":
+        return REVEAL_PAUSE
+    return random.Random(ph.text).uniform(0.2, 0.4)
+
+
 def build_timeline(spoken):
-    items, t = [], LEAD_IN
+    items, t, prev = [], LEAD_IN, None
     for ph, sp in spoken:
-        items.append(Item(ph, sp, t))
-        t += sp.duration + PAUSE
-    total = t - PAUSE + TAIL
+        p = pause_before(prev, ph)
+        t += p
+        items.append(Item(ph, sp, t, p))
+        t += sp.duration
+        prev = ph
+    total = t + TAIL
     return items, total
 
 
@@ -241,128 +250,46 @@ def _write_wav(path, audio):
         w.writeframes(pcm.tobytes())
 
 
-def _plan_shots(items, total, layout: Layout, seed: int):
-    """Фон для каждой фразы — нарисованная сцена по смыслу:
-    1) {сцена: …} прямо перед фразой; 2) слова фразы (classify);
-    3) сцена из сценария, действующая с прошлых строк; 4) предыдущая сцена.
-    Короткие вставки (меньше min_len) сливаются с соседней сценой, длинные
-    куски делятся на планы с разным движением камеры."""
-    if not items:
-        return [[0.0, "scene", "dungeon", ("scene", "dungeon"), total]]
-    from .backgrounds import Picker
-    picker = Picker(vertical=layout.H > layout.W, seed=seed)
-    want, cur, cur_img = [], None, None
-    for it in items:
-        ph = it.phrase
-        sc = (ph.scene if ph.scene_set else None) or classify(ph.text) or ph.scene or cur or "tavern"
-        cur = sc
-        if picker:
-            # свои картинки: выбор по смыслу через имя файла
-            img = picker.choose(ph.text, sc, cur_img) or cur_img
-            cur_img = img
-            want.append((("image", str(img)), ph.scene_set))
-        else:
-            want.append((("scene", sc), ph.scene_set))
-    # объединяем подряд идущие фразы с одной сценой
-    runs = []
-    for it, (sc, forced) in zip(items, want):
-        start = it.start - PAUSE / 2
-        if runs and runs[-1]["scene"] == sc:
-            runs[-1]["end"] = it.end + PAUSE / 2
-        else:
-            runs.append(dict(scene=sc, start=start, end=it.end + PAUSE / 2, forced=forced))
-    min_len = 2.2 if layout.name == "long" else 1.6
-    merged = []
-    for r in runs:
-        if merged and r["end"] - r["start"] < min_len and not r["forced"]:
-            merged[-1]["end"] = r["end"]
-        elif merged and merged[-1]["scene"] == r["scene"]:
-            merged[-1]["end"] = r["end"]
-        else:
-            merged.append(dict(r))
-    merged[0]["start"] = 0.0
-    shots = []
-    for j, r in enumerate(merged):
-        start = r["start"] if j else 0.0
-        end = merged[j + 1]["start"] if j + 1 < len(merged) else total
-        n = max(1, round((end - start) / (layout.shot_len * 1.3)))
-        for k in range(n):
-            a = start + (end - start) * k / n
-            kind, val = r["scene"]
-            shots.append([a, kind, val, r["scene"]])
-    for j, s_ in enumerate(shots):
-        s_.append(shots[j + 1][0] if j + 1 < len(shots) else total)
-    return shots  # [start, kind, value, scene, end]
-
-
-# ------------------------------------------------------------- мимика ---
-
-STRONG_WORDS = {"никогда", "всегда", "невероятно", "ужас", "серьёзно", "внимание", "клянусь",
-                "абсолютно", "огромный", "огромная", "вообще", "честно", "именно", "главное"}
-
-
-def _is_emphatic(ph: Phrase) -> bool:
-    """«Важная» фраза: восклицание или важный/злой тон — сэр Лат подаётся вперёд."""
-    return "!" in ph.text or ph.emotion in ("important", "angry") and len(ph.text.split()) >= 5
-
-
-def _gestures(items, env, seed):
-    """Ударные слова -> короткие взмахи крылом: (время, крыло, сила в градусах)."""
-    rnd = random.Random(seed * 17 + 3)
-    out, last = [], -10.0
-    for it in items:
-        words = it.speech.words
-        if not words:
-            continue
-        loud = []
-        for w in words:
-            a, b = int((it.start + w.start) * FPS), int((it.start + w.end) * FPS) + 1
-            seg = env[a:b]
-            loud.append(float(seg.mean()) if len(seg) else 0.0)
-        mean = (sum(loud) / len(loud)) or 1.0
-        for w, lv in zip(words, loud):
-            core = w.text.strip(".,!?…:;—«»\"'()").lower()
-            score = lv / mean
-            score += 0.7 if w.text.rstrip("»\")").endswith("!") else 0
-            score += 0.5 if core in STRONG_WORDS else 0
-            score += 0.3 if len(core) >= 9 else 0
-            score += 0.3 if any(ch.isdigit() for ch in core) else 0
-            t = it.start + w.start
-            if score >= 1.55 and t - last >= 1.6:
-                side = "l" if rnd.random() < 0.7 else "r"   # чаще — крылом к экрану
-                out.append((t - 0.05, side, rnd.uniform(14, 22)))
-                last = t
-    return out
-
-
-# ----------------------------------------------------------------- рендер ---
-
 def render_part(part: Part, spoken, layout: Layout, out_path: Path,
-                seed: int = 0, show_title: bool = True, max_seconds: float | None = None):
+                seed: int = 0, show_title: bool = True, max_seconds: float | None = None,
+                t0: float = 0.0):
+    """t0 — время начала части в видео (чтобы зум и огонь шли без скачков между частями)."""
     items, total = build_timeline(spoken)
     if max_seconds:
         total = min(total, max_seconds)
     W, H = layout.W, layout.H
     n_frames = int(math.ceil(total * FPS))
-    audio = _mix_audio(items, total)
+    audio = postprocess(_mix_audio(items, total))     # лёгкое шумоподавление + −14 LUFS
     wav = out_path.with_suffix(".wav")
     _write_wav(wav, audio)
     env = mouth_envelope(audio, FPS, n_frames)
 
-    gestures = _gestures(items, env, seed)
-    emphatic = [_is_emphatic(it.phrase) for it in items]
-    lat_anim = character.Animator(FPS, layout.lat_h, seed, gestures, screen_side="right")
+    scene = CampfireScene(W, H, FPS, seed=1)
+    lat_anim = character.Animator(FPS, layout.lat_h, seed, screen_side="right", style="campfire")
+    lat_w, lat_h = lat_anim.cw, lat_anim.ch
+    lat_x = int(W * layout.lat_cx - lat_w / 2)
+    lat_y = int(scene.ground_y + lat_h * 0.06 - lat_h)
+    char_w = int(lat_w * character.BASE_W / character.W)
+    fire_right = scene.fire_xy[0] > W * layout.lat_cx
+    sh_rgb, sh_al = ground_shadow(int(char_w * 1.1), max(8, int(lat_h * 0.05)))
+    log_rgb, log_al = log_sprite(int(char_w * 1.15), max(10, int(lat_h * 0.17)))
+    log_x = int(W * layout.lat_cx - log_rgb.shape[1] / 2 - lat_w * 0.02)
+    log_y = int(lat_y + lat_h - log_rgb.shape[0] * 0.78)
+    # облачко над головой: справа сверху от шлема
+    bsize = int(lat_w * 0.5)
+    head_x = lat_x + (character.OFF_X + character.BASE_W * 0.8) * lat_h / character.H
+    head_y = lat_y + (character.OFF_Y + character.BASE_H * 0.06) * lat_h / character.H
+    events = bubble_events(items)
+
     # кому какая фраза соответствует в каждом кадре
     phrase_at = np.zeros(n_frames, np.int32)
     for idx, it in enumerate(items):
-        a = int((it.start - (PAUSE / 2 if idx else LEAD_IN)) * FPS)
+        a = int((it.start - (it.pause / 2 if idx else LEAD_IN)) * FPS)
         phrase_at[max(a, 0):] = idx
 
-    shots = _plan_shots(items, total, layout, seed)
     sprites = SpriteCache()
     subs = SpriteCache(48)
     windows = SpriteCache()
-    lat_x, lat_y = layout.lat_xy
     sx0, sy, sx1 = layout.sub_box
     sub_font = font(layout.sub_font)
     sub_w = sx1 - sx0 - int(layout.sub_font * 0.9)
@@ -377,39 +304,50 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path,
            "-shortest", "-movflags", "+faststart", str(out_path)]
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-    shot_idx, bg, prev_last = -1, None, None
     try:
         for fi in range(n_frames):
             t = fi / FPS
-            # --- фон
-            while shot_idx + 1 < len(shots) and t >= shots[shot_idx + 1][0]:
-                if bg is not None:
-                    bg.close()
-                shot_idx += 1
-                s0, kind, val, scene, s1 = shots[shot_idx]
-                nf = int((s1 - s0) * FPS) + 2
-                if kind == "image":
-                    from .backgrounds import ImageScene
-                    bg = ImageScene(Path(val), W, H, FPS, nf, shot_seed=seed * 31 + shot_idx)
-                else:
-                    # одна и та же локация во всём видео (seed=0), камера у каждого плана своя
-                    bg = AnimatedScene(val, W, H, FPS, nf, seed=0, shot_seed=seed * 31 + shot_idx)
-                shot_start_frame = fi
-            local = fi - shot_start_frame
-            frame = bg.frame(local)
-            if prev_last is not None and local < XFADE * FPS and shot_idx > 0:
-                k = local / (XFADE * FPS)
-                frame = (prev_last * (1 - k) + frame * k).astype(np.uint8)
-            # запомним последний кадр плана для перехода
-            if shot_idx + 1 < len(shots) and t + 1 / FPS >= shots[shot_idx + 1][0]:
-                prev_last = frame.astype(np.float32)
+            # --- поляна: медленный зум, мерцание костра, искры
+            frame, k = scene.frame(t0 + t)
 
             it_idx = int(phrase_at[fi])
             it = items[it_idx] if items else None
-            ph = it.phrase if it else Phrase("")
 
+            # --- сэр Лат у бревна: тень на земле, свет костра, клюв в такт голосу
+            blend(frame, sh_rgb, sh_al * (0.5 + 0.12 * (1 - k)),
+                  int(W * layout.lat_cx - sh_rgb.shape[1] * (0.62 if fire_right else 0.38)),
+                  int(scene.ground_y - sh_rgb.shape[0] / 2))
+            speaking = bool(it) and it.start <= t <= it.end + 0.05
+            vowel = None
+            if speaking:
+                rel = t - it.start
+                for w in it.speech.words:
+                    if w.start <= rel < w.end:
+                        vowel = character.vowel_at(w.text, (rel - w.start) / max(1e-3, w.end - w.start))
+                        break
+            spr = lat_anim.calm_frame(t0 + t, float(env[fi]), vowel, speaking)
+            rgb, al = _to_np_rgba(spr)
+            blend(frame, light_sprite(rgb, al, k, fire_right), al, lat_x, lat_y)
+            blend(frame, light_sprite(log_rgb, log_al, k * 0.9, fire_right), log_al, log_x, log_y)
+            frame = scene.grade(frame)
+
+            # --- облачко-мысль с эмодзи по эмоции фразы
+            bs = bubble_state(events, t)
+            if bs:
+                emoji, op, sc = bs
+                bimg = sprites.get(lambda: thought_bubble(emoji, bsize, True), ("bubble", emoji))
+                brgb, bal = bimg
+                if sc < 0.999:
+                    pil = thought_bubble(emoji, bsize, True)
+                    pil = pil.resize((max(1, int(pil.width * sc)), max(1, int(pil.height * sc))), Image.BILINEAR)
+                    brgb, bal = _to_np_rgba(pil)
+                bob = math.sin(2 * math.pi * t / 2.2) * lat_h * 0.004
+                blend(frame, brgb, bal, int(head_x - brgb.shape[1] * 0.2),
+                      int(head_y - brgb.shape[0] * 0.78 + bob), op)
+
+            ph = it.phrase if it else Phrase("")
             # --- игровое окно
-            if it and ph.window and it.start - 0.2 <= t <= it.end + PAUSE:
+            if it and ph.window and it.start - 0.2 <= t <= it.end + 0.3:
                 rgbw = windows.get(lambda: game_window(ph.window, layout.window_w), ph.window)
                 rgb, al = rgbw
                 appear = min(1.0, (t - it.start + 0.2) / 0.25)
@@ -428,24 +366,8 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path,
             else:
                 blend(frame, rgb, al, (W - rgb.shape[1]) // 2, 40)
 
-            # --- сэр Лат
-            emo, pose = ph.emotion, ph.pose
-            speaking = bool(it) and it.start <= t <= it.end + 0.05
-            vowel = None
-            if speaking:
-                rel = t - it.start
-                for w in it.speech.words:
-                    if w.start <= rel < w.end:
-                        vowel = character.vowel_at(w.text, (rel - w.start) / max(1e-3, w.end - w.start))
-                        break
-            spr = lat_anim.frame(t, emo, pose, float(env[fi]), vowel,
-                                 emphatic=bool(it) and emphatic[it_idx] and it.start - 0.2 <= t <= it.end,
-                                 speaking=speaking)
-            rgb, al = _to_np_rgba(spr)
-            blend(frame, rgb, al, lat_x, lat_y)
-
             # --- субтитры по словам
-            if it and it.start - 0.05 <= t <= it.end + PAUSE * 0.6:
+            if it and it.start - 0.05 <= t <= it.end + 0.25:
                 if it_idx not in pages_cache:
                     pages_cache.clear()
                     pages_cache[it_idx] = _paginate(it.speech.words, sub_font, sub_w, layout.sub_lines)
@@ -467,8 +389,7 @@ def render_part(part: Part, spoken, layout: Layout, out_path: Path,
 
             enc.stdin.write(frame.tobytes())
     finally:
-        if bg is not None:
-            bg.close()
+        scene.close()
         enc.stdin.close()
         enc.wait()
         wav.unlink(missing_ok=True)

@@ -27,13 +27,11 @@ jobs:
     timeout-minutes: 300
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      # запасной генератор фонов FLUX.1-schnell (необязательно)
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
       PYTHONUNBUFFERED: "1"
-      # распознавание своей записи голоса (voice/): medium точнее small
+      # тайминги слов для субтитров и клюва: medium точнее small
       WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'medium' }}
-      VOICE_PITCH: ${{ vars.VOICE_PITCH || '0' }}
+      PIPER_MODEL_DIR: ~/.cache/piper
       NOTES_FILE: ${{ inputs.notes_file }}
       VIDEO_FORMAT: ${{ inputs.format }}
       VIDEO_MINUTES: ${{ inputs.minutes }}
@@ -48,33 +46,35 @@ jobs:
       - name: Установить ffmpeg и шрифты
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q ffmpeg fonts-dejavu-core
+          sudo apt-get install -y -q ffmpeg fonts-dejavu-core fonts-noto-color-emoji
 
       - name: Установить зависимости
-        run: |
-          pip install -r requirements.txt
-          # torch (CPU) для основного голоса Silero
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: pip install -r requirements.txt
 
-      - name: Кэш модели Silero
+      # голос сэра Лата: Piper IGM (rraaww/ru_piper) — скачивается один раз
+      - name: Кэш голоса Piper IGM
         uses: actions/cache@v4
         with:
-          path: ~/.cache/silero
-          key: silero-v4_ru
+          path: ~/.cache/piper
+          key: piper-ru_RU-igm3804-medium-v1
+
+      - name: Скачать голос Piper IGM
+        run: |
+          mkdir -p ~/.cache/piper && cd ~/.cache/piper
+          for f in ru_RU-igm3804-medium.onnx ru_RU-igm3804-medium.onnx.json; do
+            if [ ! -s "$f" ]; then
+              curl -fsSL --retry 4 --retry-delay 5 -o "$f" \
+                "https://huggingface.co/rraaww/ru_piper/resolve/main/$f" || {
+                echo "::error::Не удалось скачать голос IGM ($f) с huggingface.co/rraaww/ru_piper"; exit 1; }
+            fi
+          done
+          ls -la ~/.cache/piper
 
       - name: Кэш модели faster-whisper
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
           key: whisper-${{ vars.WHISPER_MODEL || 'medium' }}-v1
-
-      # сгенерированные фоны переживают запуск — похожие сцены берут готовые
-      - name: Кэш сгенерированных фонов
-        uses: actions/cache@v4
-        with:
-          path: backgrounds/generated
-          key: bg-generated-${{ github.run_id }}
-          restore-keys: bg-generated-
 
       - name: Найти файл заметок
         # Ищем во всех папках notes/ репозитория. Можно указать путь
@@ -119,8 +119,6 @@ jobs:
           name: sir-lat-${{ inputs.format }}-${{ github.run_number }}
           path: |
             output/**/*.mp4
-            output/**/*_golos_chistyj.mp3
             output/**/script_*.txt
-            backgrounds/generated/
           if-no-files-found: error
           retention-days: 14
